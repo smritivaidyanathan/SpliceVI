@@ -15,7 +15,7 @@ from scvi.module.base import BaseModuleClass, LossOutput, auto_move_data
 from scvi.nn import DecoderSCVI, Encoder, FCLayers, LinearDecoderSCVI
 from partialvae import PartialEncoderEDDI, PartialEncoderEDDIATSE,PartialEncoderWeightedSumEDDIMultiWeight, PartialEncoderWeightedSumEDDIMultiWeightATSE, PartialEncoderEDDIFast, PartialEncoderEDDIATSEFast,PartialEncoderWeightedSumEDDIMultiWeightFast, PartialEncoderWeightedSumEDDIMultiWeightATSEFast, PartialEncoderEDDIFaster, PartialEncoderEDDIATSEFaster,PartialEncoderWeightedSumEDDIMultiWeightFaster, PartialEncoderWeightedSumEDDIMultiWeightATSEFaster, LinearDecoder, group_logsumexp, subtract_group_logsumexp, nbetaln
 
-from scvi.utils import masked_softmax
+
 
 
 class LibrarySizeEncoder(torch.nn.Module):
@@ -89,6 +89,17 @@ class DecoderSplice(torch.nn.Module):
 
 
 
+def masked_softmax(weights, mask, dim=-1, eps=1e-30):
+    """Computes a softmax of ``weights`` along ``dim`` where ``mask is True``.
+    TAKEN FROM SCVI.MODULE _UTILS.py
+    Adds a small ``eps`` term in the numerator and denominator to avoid zero division.
+    Taken from: https://discuss.pytorch.org/t/apply-mask-softmax/14212/15.
+    Pytorch issue tracked at: https://github.com/pytorch/pytorch/issues/55056.
+    """
+    weight_exps = torch.exp(weights)
+    masked_exps = weight_exps.masked_fill(mask == 0, eps)
+    masked_sums = masked_exps.sum(dim, keepdim=True) + eps
+    return masked_exps / masked_sums
 
 class SPLICEVAE(BaseModuleClass):
     """
@@ -705,7 +716,7 @@ class SPLICEVAE(BaseModuleClass):
     def _get_inference_input(self, tensors):
         """Assemble inputs for the inference network from registered fields."""
         x = tensors.get(REGISTRY_KEYS.X_KEY, None)
-        x_junc = tensors.get(REGISTRY_KEYS.JUNC_RATIO_X_KEY, None)
+        x_junc = tensors.get("junc_ratio", None)
         if x is not None and x_junc is not None:
             x = torch.cat((x, x_junc), dim=-1)
         batch_index = tensors[REGISTRY_KEYS.BATCH_KEY]
@@ -713,7 +724,7 @@ class SPLICEVAE(BaseModuleClass):
         cont_covs = tensors.get(REGISTRY_KEYS.CONT_COVS_KEY)
         cat_covs = tensors.get(REGISTRY_KEYS.CAT_COVS_KEY)
         label = tensors[REGISTRY_KEYS.LABELS_KEY]
-        psi_mask = tensors.get(REGISTRY_KEYS.PSI_MASK_KEY)
+        psi_mask = tensors.get("psi_observed_mask")
         size_factor = tensors.get(REGISTRY_KEYS.SIZE_FACTOR_KEY, None)
         return {
             "x": x,
@@ -1057,7 +1068,7 @@ class SPLICEVAE(BaseModuleClass):
         # Retrieve splicing count data if available
         total_counts = tensors.get("atse_counts_key", None)
         junction_counts = tensors.get("junc_counts_key", None)
-        psi_mask = tensors.get(REGISTRY_KEYS.PSI_MASK_KEY, None)
+        psi_mask = tensors.get("psi_observed_mask", None)
         if psi_mask is not None:
             psi_mask = psi_mask.to(torch.bool)
 

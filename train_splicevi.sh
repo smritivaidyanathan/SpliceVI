@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
-#
+#SBATCH --job-name=splicevi_train_basic
+#SBATCH --output=logs/splicevi_train_%j.out
+#SBATCH --error=logs/splicevi_train_%j.err
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --mem=230G
+#SBATCH --time=24:00:00
+
+
+set -euo pipefail
 # train_splicevi.sh
 #
 # Minimal Slurm job script to:
@@ -13,17 +22,6 @@
 #
 # Submit with:
 #   sbatch train_splicevi.sh
-#
-
-#SBATCH --job-name=splicevi_train_basic
-#SBATCH --output=/gpfs/commons/home/svaidyanathan/logs/splicevi_train_basic_%j.out
-#SBATCH --error=/gpfs/commons/home/svaidyanathan/logs/splicevi_train_basic_%j.err
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
-#SBATCH --mem=230G
-#SBATCH --time=24:00:00
-
-set -euo pipefail
 
 #######################################
 # USER CONFIGURATION
@@ -43,7 +41,7 @@ CONDA_BASE="/gpfs/commons/home/svaidyanathan/miniconda3"
 ENV_NAME="splicevi-env"
 
 # 3) Core hyperparameters
-MAX_EPOCHS=500          # Total training epochs
+MAX_EPOCHS=1          # Total training epochs
 LR=1e-5                 # Learning rate
 BATCH_SIZE=256          # Minibatch size
 N_EPOCHS_KL_WARMUP=100  # KL warmup epochs

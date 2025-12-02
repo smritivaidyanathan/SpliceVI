@@ -1,6 +1,17 @@
 # SpliceVI
 
-conda create -n splicevi-env python=3.13  # any python 3.11 to 3.13
-conda activate splicevi-env
-conda install scvi-tools -c conda-forge
+git clone https://github.com/smritivaidyanathan/SpliceVI
 
+cd SpliceVI
+
+conda create -n splicevi-env python=3.13  # any python 3.11 to 3.13
+
+conda activate splicevi-env
+
+pip install -r requirements.txt
+
+chmod +x train_splicevi.sh
+chmod +x eval_splicevi.sh
+
+train_splicevi.sh
+eval_splicevi.sh

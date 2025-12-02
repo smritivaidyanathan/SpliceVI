@@ -40,7 +40,6 @@ from scvi.model.base import (
 from scvi.model.base._de_core import _de_core
 from splicevae import SPLICEVAE
 from scvi.train import AdversarialTrainingPlan
-from scvi.train._callbacks import SaveBestState
 from scvi.utils import track
 from scvi.utils._docstrings import de_dsp, devices_dsp, setup_anndata_dsp
 
@@ -595,7 +594,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
 
     def init_feature_embedding_from_adata(self) -> None:
         print("Initializing feature embeddings...")
-        jr_info = self.adata_manager.data_registry[REGISTRY_KEYS.JUNC_RATIO_X_KEY]
+        jr_info = self.adata_manager.data_registry["junc_ratio"]
         jr_key, mod_key = jr_info.attr_key, jr_info.mod_key
         X = self.adata[mod_key].layers[jr_key]
         # keep X sparse:
@@ -632,7 +631,6 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
         eps: float = 1e-08,
         early_stopping: bool = True,
         early_stopping_patience: int = 50,
-        save_best: bool = True,
         check_val_every_n_epoch: int | None = None,
         n_steps_kl_warmup: int | None = None,
         n_epochs_kl_warmup: int | None = 50,
@@ -674,8 +672,6 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
             Whether to enable early stopping.
         early_stopping_patience
             Number of epochs with no improvement before stopping.
-        save_best
-            Whether to save the best model checkpoint.
         check_val_every_n_epoch
             How often (in epochs) to run validation.
         n_steps_kl_warmup, n_epochs_kl_warmup
@@ -732,18 +728,6 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
             plan_kwargs = update_dict
 
         datasplitter_kwargs = datasplitter_kwargs or {}
-
-        if save_best:
-            warnings.warn(
-                "`save_best` is deprecated in v1.2 and will be removed in v1.3. "
-                "Please use `enable_checkpointing` instead. See "
-                "https://github.com/scverse/scvi-tools/issues/2568 for more details.",
-                DeprecationWarning,
-                stacklevel=settings.warnings_stacklevel,
-            )
-            if "callbacks" not in kwargs:
-                kwargs["callbacks"] = []
-            kwargs["callbacks"].append(SaveBestState(monitor="reconstruction_loss_validation"))
 
         data_splitter = self._data_splitter_cls(
             self.adata_manager,
@@ -1438,15 +1422,15 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
         ) -> dict[str, np.ndarray]:
             """Empirical PSI means and effect on the junc_ratio matrix.
 
-            Pulls PSI from REGISTRY_KEYS.JUNC_RATIO_X_KEY and returns:
+            Pulls PSI from "junc_ratio" and returns:
             emp_mean1, emp_mean2, emp_effect = mean2 - mean1
             Observed counts per junction in each group are also returned:
             obs_count1, obs_count2.
             Means are computed only across observed (mask=1) junctions.
             If a junction is not observed in any cell in a group, its mean is set to -1.
             """
-            X = adata_manager.get_from_registry(REGISTRY_KEYS.JUNC_RATIO_X_KEY)  # (cells x junctions)
-            M = adata_manager.get_from_registry(REGISTRY_KEYS.PSI_MASK_KEY)      # (cells x junctions), 0/1
+            X = adata_manager.get_from_registry("junc_ratio")  # (cells x junctions)
+            M = adata_manager.get_from_registry("psi_observed_mask")      # (cells x junctions), 0/1
 
             X1, X2 = X[idx1], X[idx2]
             M1, M2 = M[idx1], M[idx2]
@@ -1648,7 +1632,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
         if cell_by_cluster_matrix is not None:
             anndata_fields.append(LayerField("cell_by_cluster_matrix", cell_by_cluster_matrix, is_count_data=True))
         if psi_mask_layer is not None:
-            anndata_fields.append(LayerField(REGISTRY_KEYS.PSI_MASK_KEY, psi_mask_layer, is_count_data=False))
+            anndata_fields.append(LayerField("psi_observed_mask", psi_mask_layer, is_count_data=False))
         adata_manager = AnnDataManager(fields=anndata_fields, setup_method_args=setup_method_args)
         adata_manager.register_fields(adata, **kwargs)
         cls.register_manager(adata_manager)
@@ -1753,7 +1737,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
             # Register the primary splicing data as X from the specified junc_ratio_layer.
             mudata_fields.append(
                 fields.MuDataLayerField(
-                    REGISTRY_KEYS.JUNC_RATIO_X_KEY,
+                    "junc_ratio",
                     junc_ratio_layer,  # e.g. "junc_ratio"
                     mod_key=modalities.junc_ratio_layer,
                     is_count_data=True,
@@ -1788,7 +1772,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
                 psi_mask_layer = "mask"
             mudata_fields.append(
                 fields.MuDataLayerField(
-                    REGISTRY_KEYS.PSI_MASK_KEY,  # internal key used by the model
+                    "psi_observed_mask",  # internal key used by the model
                     psi_mask_layer,
                     mod_key=modalities.junc_ratio_layer,
                     is_count_data=False,

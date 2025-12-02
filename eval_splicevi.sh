@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
-#
+#SBATCH --job-name=splicevi_eval_batch
+#SBATCH --output=/logs/splicevi_train_%j.out
+#SBATCH --error=/logs/splicevi_train_%j.err
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --mem=230G
+#SBATCH --time=30:00:00
+
+set -euo pipefail
+
+
 # eval_splicevi.sh
 #
 # Eval-only Slurm driver for SPLICEVI.
@@ -14,16 +24,6 @@
 
 # Submit with:
 #   sbatch eval_splicevi.sh
-
-#SBATCH --job-name=splicevi_eval_batch
-#SBATCH --output=/gpfs/commons/home/svaidyanathan/logs/splicevi_eval_batch_%j.out
-#SBATCH --error=/gpfs/commons/home/svaidyanathan/logs/splicevi_eval_batch_%j.err
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
-#SBATCH --mem=230G
-#SBATCH --time=30:00:00
-
-set -euo pipefail
 
 #######################################
 # USER CONFIGURATION
@@ -60,19 +60,27 @@ EVALS=(
 )
 
 # 4) UMAP and imputation config
-UMAP_TOP_N_CELLTYPES=15       # highlight only top N cell types; rest collapsed into "Other"
+UMAP_TOP_N_CELLTYPES=15       # kept for compatibility (currently unused in plotting logic)
 IMPUTE_BATCH_SIZE=256         # set to -1 to disable batching (one big batch per masked file)
+
+# List of obs keys to use for coloring TRAIN UMAPs for each latent space
+UMAP_OBS_KEYS=(
+  "broad_cell_type"
+  "medium_cell_type"
+  # "tissue"
+  # "tissue_celltype"
+)
 
 # 5) Conda / script locations
 CONDA_BASE="/gpfs/commons/home/svaidyanathan/miniconda3"
-ENV_NAME="scvi-env"
+ENV_NAME="splicevi-env"
 SCRIPT_PATH="/gpfs/commons/home/svaidyanathan/repos/multivi_tools_splicing/multivi_splice_utils/runfiles/eval_splicevi_basic.py"
 
 # 6) W&B configuration (optional)
 USE_WANDB=true                        # set to "false" to disable W&B logging
 WANDB_PROJECT="MLCB_SUBMISSION"       # required if USE_WANDB=true
 WANDB_ENTITY=""                       # optional W&B entity (team)
-WANDB_GROUP="splicevi_eval"      # optional W&B group name
+WANDB_GROUP="splicevi_eval"           # optional W&B group name
 WANDB_RUN_NAME_PREFIX="basic_eval"    # prefix for per-model run names
 WANDB_LOG_FREQ=1000                   # how often to log from wandb.watch
 
@@ -94,6 +102,10 @@ done
 echo "[BATCH] MODEL_DIRS:"
 for m in "${MODEL_DIRS[@]}"; do
   echo "         - ${m}"
+done
+echo "[BATCH] UMAP_OBS_KEYS:"
+for k in "${UMAP_OBS_KEYS[@]}"; do
+  echo "         - ${k}"
 done
 echo "[BATCH] Output batch dir = ${BATCH_RUN_DIR}"
 echo "=================================================================="
@@ -130,6 +142,7 @@ echo
 #######################################
 
 EVALS_JOINED="${EVALS[*]}"
+UMAP_OBS_KEYS_JOINED="${UMAP_OBS_KEYS[*]}"
 
 job_index=0
 for MODEL_DIR in "${MODEL_DIRS[@]}"; do
@@ -189,6 +202,7 @@ echo "[EVAL] TEST_MDATA_PATH  = ${TEST_MDATA_PATH}"
 echo "[EVAL] FIG_DIR          = ${FIG_DIR}"
 echo "[EVAL] MAPPING_CSV      = ${MAPPING_CSV}"
 echo "[EVAL] EVALS            = ${EVALS_JOINED}"
+echo "[EVAL] UMAP_OBS_KEYS    = ${UMAP_OBS_KEYS_JOINED}"
 echo "[EVAL] IMPUTE_BATCH_SIZE= ${IMPUTE_BATCH_SIZE}"
 echo "[EVAL] UMAP_TOP_N_CT    = ${UMAP_TOP_N_CELLTYPES}"
 
@@ -203,6 +217,7 @@ python "${SCRIPT_PATH}" \
   --mapping_csv "${MAPPING_CSV}" \
   --impute_batch_size ${IMPUTE_BATCH_SIZE} \
   --umap_top_n_celltypes ${UMAP_TOP_N_CELLTYPES} \
+  --umap_obs_keys ${UMAP_OBS_KEYS_JOINED} \
   --evals ${EVALS_JOINED} \
   ${MASKED_TEST_MDATA_PATHS:+--masked_test_mdata_paths ${MASKED_TEST_MDATA_PATHS}} \
   ${PER_JOB_WANDB_ARGS}

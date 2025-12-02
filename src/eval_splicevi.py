@@ -48,6 +48,8 @@ from sklearn.preprocessing import StandardScaler
 from scipy import sparse
 from scipy.stats import spearmanr
 
+from tqdm.auto import tqdm
+
 from splicevi import SPLICEVI
 
 import gc
@@ -77,7 +79,7 @@ def apply_obs_mapping_from_csv(mdata, mapping_csv: str):
     Overwrite selected obs fields on mdata, mdata['rna'], and mdata['splicing']
     using a mapping CSV with one row per cell.
 
-    Expected columns in the mapping CSV (your file had e.g.):
+    Expected columns in the mapping CSV (example):
         'cell_id', 'cell_name', 'cell_ontology_class',
         'broad_cell_type', 'medium_cell_type', 'tissue', 'tissue_celltype'
 
@@ -140,7 +142,7 @@ def apply_obs_mapping_from_csv(mdata, mapping_csv: str):
             )
         return
 
-    # If we’re here, we have an explicit join_on column
+    # If we reach here, we have an explicit join_on column
     print(f"[obs-mapping] Joining on '{join_on}'")
 
     df = df.set_index(join_on)
@@ -181,50 +183,6 @@ def apply_obs_mapping_from_csv(mdata, mapping_csv: str):
 
 
 # ---------------------------------------------------------------------
-# UMAP helper: top-N cell types
-# ---------------------------------------------------------------------
-def make_topn_categorical(
-    ad,
-    col: str,
-    top_n: Optional[int],
-) -> Tuple[str, Optional[List[str]], Optional[Dict[str, str]]]:
-    """
-    For a categorical column `col` in ad.obs:
-      - If top_n is None or <= 0: return (col, None, None) and do nothing.
-      - Else: create a new column <col>_topN where only the top_n most frequent
-        categories retain their labels; all others become 'Other'.
-
-    Returns:
-      new_col_name, list_of_top_categories, palette_dict (category -> color) or None.
-    """
-    if top_n is None or top_n <= 0:
-        return col, None, None
-
-    if col not in ad.obs.columns:
-        raise KeyError(f"[topN] Column '{col}' not found in ad.obs.")
-
-    vc = ad.obs[col].value_counts()
-    top = vc.index.to_list()[:top_n]
-
-    new_col = f"{col}_top{top_n}"
-    ad.obs[new_col] = ad.obs[col].where(ad.obs[col].isin(top), other="Other")
-
-    cats = list(dict.fromkeys(top + ["Other"]))
-    base_colors = sc.pl.palettes.default_20
-
-    if len(cats) > len(base_colors):
-        raise ValueError(
-            f"[topN] Need {len(cats)} colors but default palette has only "
-            f"{len(base_colors)}. Reduce --umap_top_n_celltypes or extend the palette."
-        )
-
-    palette = {ct: base_colors[i] for i, ct in enumerate(top)}
-    palette["Other"] = "lightgray"
-
-    return new_col, top, palette
-
-
-# ---------------------------------------------------------------------
 # Evaluation helper: train/test split metrics
 # ---------------------------------------------------------------------
 AGE_R2_RECORDS = []
@@ -247,15 +205,17 @@ def evaluate_split(
       - LR classification on medium cell type
       - Age R² overall + per tissue|celltype group
     """
-    print(f"\n=== Evaluating {name.upper()}-{Z_type} split ===")
+    print(f"\n=== [EVAL] Evaluating {name.upper()} split for latent space '{Z_type}' ===")
     Z = model.get_latent_representation(adata=mdata, modality=Z_type)
+    print(f"[EVAL/{name}-{Z_type}] Latent shape: {Z.shape}")
 
     # PCA 90% variance
+    print(f"[EVAL/{name}-{Z_type}] Running PCA to explain 90% variance...")
     n_comp_max = min(Z.shape[0], Z.shape[1])
     pca = PCA(n_components=n_comp_max, svd_solver="full").fit(Z)
     cum_var = np.cumsum(pca.explained_variance_ratio_)
     pcs_90 = int(np.searchsorted(cum_var, 0.90) + 1)
-    print(f"[{name}-{Z_type}] PCs for 90% variance: {pcs_90}/{Z.shape[1]}")
+    print(f"[EVAL/{name}-{Z_type}] PCs for 90% variance: {pcs_90}/{Z.shape[1]}")
 
     if wandb is not None:
         wandb.log(
@@ -267,10 +227,16 @@ def evaluate_split(
         )
 
     # Silhouette scores
+    print(f"[EVAL/{name}-{Z_type}] Computing silhouette scores...")
     labels_broad = mdata.obs[umap_color_key].astype(str).values
     sil_broad = silhouette_score(Z, labels_broad)
     labels_med = mdata.obs[cell_type_classification_key].astype(str).values
     sil_med = silhouette_score(Z, labels_med)
+
+    print(f"[EVAL/{name}-{Z_type}] Silhouette ({umap_color_key}): {sil_broad:.4f}")
+    print(
+        f"[EVAL/{name}-{Z_type}] Silhouette ({cell_type_classification_key}): {sil_med:.4f}"
+    )
 
     if wandb is not None:
         wandb.log(
@@ -281,39 +247,45 @@ def evaluate_split(
         )
 
     # LR classification on medium cell type
+    print(f"[EVAL/{name}-{Z_type}] Training logistic regression classifier...")
     Z_tr, Z_ev, y_tr, y_ev = train_test_split(
         Z, labels_med, test_size=0.2, random_state=0
     )
     clf = LogisticRegression(max_iter=1000).fit(Z_tr, y_tr)
     y_pred = clf.predict(Z_ev)
 
+    acc = accuracy_score(y_ev, y_pred)
+    prec = precision_score(y_ev, y_pred, average="weighted", zero_division=0)
+    rec = recall_score(y_ev, y_pred, average="weighted", zero_division=0)
+    f1 = f1_score(y_ev, y_pred, average="weighted", zero_division=0)
+
+    print(f"[EVAL/{name}-{Z_type}] LR accuracy:  {acc:.4f}")
+    print(f"[EVAL/{name}-{Z_type}] LR precision: {prec:.4f}")
+    print(f"[EVAL/{name}-{Z_type}] LR recall:    {rec:.4f}")
+    print(f"[EVAL/{name}-{Z_type}] LR F1:        {f1:.4f}")
+
     if wandb is not None:
         wandb.log(
             {
-                f"real-{name}-{Z_type}/accuracy": accuracy_score(y_ev, y_pred),
-                f"real-{name}-{Z_type}/precision": precision_score(
-                    y_ev, y_pred, average="weighted", zero_division=0
-                ),
-                f"real-{name}-{Z_type}/recall": recall_score(
-                    y_ev, y_pred, average="weighted", zero_division=0
-                ),
-                f"real-{name}-{Z_type}/f1_score": f1_score(
-                    y_ev, y_pred, average="weighted", zero_division=0
-                ),
+                f"real-{name}-{Z_type}/accuracy": acc,
+                f"real-{name}-{Z_type}/precision": prec,
+                f"real-{name}-{Z_type}/recall": rec,
+                f"real-{name}-{Z_type}/f1_score": f1,
             }
         )
 
     # Age regression tasks
     if "age_numeric" in mdata.obs:
+        print(f"[EVAL/{name}-{Z_type}] Running age R² regression tasks...")
         ages_full = mdata.obs["age_numeric"].astype(float).values
         target_ages = np.array([3.0, 18.0, 24.0], dtype=float)
         mask_age = np.isin(ages_full, target_ages)
         n_kept = int(mask_age.sum())
-        print(f"[{name}-{Z_type}] Kept {n_kept}/{len(mask_age)} cells at ages {target_ages.tolist()}")
+        print(f"[EVAL/{name}-{Z_type}] Kept {n_kept}/{len(mask_age)} cells at ages {target_ages.tolist()}")
 
         if n_kept < MIN_GROUP_N:
             print(
-                f"[{name}-{Z_type}] Only {n_kept} cells with target ages; skipping age R² tasks."
+                f"[EVAL/{name}-{Z_type}] Only {n_kept} cells with target ages; skipping age R² tasks."
             )
             return
 
@@ -329,11 +301,12 @@ def evaluate_split(
         # Global R²
         if np.std(y_tr) == 0.0 or np.std(y_ev) == 0.0:
             print(
-                f"[{name}-{Z_type}] Degenerate age variance after filtering; skipping global age R²."
+                f"[EVAL/{name}-{Z_type}] Degenerate age variance after filtering; skipping global age R²."
             )
         else:
             ridge = RidgeCV(alphas=np.logspace(-2, 3, 20), cv=5).fit(X_tr, y_tr)
             r2_age = ridge.score(X_ev, y_ev)
+            print(f"[EVAL/{name}-{Z_type}] Global age R²: {r2_age:.4f}")
             if wandb is not None:
                 wandb.log(
                     {
@@ -349,6 +322,10 @@ def evaluate_split(
             ct_series = obs_local[ct_key].astype(str)
             pair = tissue_series + " | " + ct_series
             pair_unique = pair.unique()
+
+            print(
+                f"[EVAL/{name}-{Z_type}] Computing per-group age R² for {len(pair_unique)} tissue|cell_type pairs..."
+            )
 
             for p in pair_unique:
                 idx = np.where(pair.values == p)[0]
@@ -389,6 +366,8 @@ def evaluate_split(
                         "n": int(idx.size),
                     }
                 )
+    else:
+        print(f"[EVAL/{name}-{Z_type}] No 'age_numeric' column found; skipping age R².")
 
 
 # ---------------------------------------------------------------------
@@ -460,8 +439,16 @@ def build_argparser():
         type=int,
         default=None,
         help=(
-            "If set, UMAP legends will highlight only the top N cell types by frequency; "
-            "all others are merged into 'Other' and shown in gray."
+            "Currently unused in plotting logic. Kept for compatibility with old configs."
+        ),
+    )
+    parser.add_argument(
+        "--umap_obs_keys",
+        nargs="+",
+        default=None,
+        help=(
+            "List of .obs keys to color TRAIN UMAPs by. "
+            "If not provided, defaults to ['broad_cell_type', 'medium_cell_type' (if present)]."
         ),
     )
 
@@ -527,13 +514,20 @@ def main():
     parser = build_argparser()
     args = parser.parse_args()
     EVALS = set(args.evals)
-    TOP_N_CT = args.umap_top_n_celltypes
 
     os.makedirs(args.fig_dir, exist_ok=True)
 
     # W&B
     wandb = maybe_import_wandb()
     run = None
+
+    # Basic keys used in several places
+    umap_color_key_default = "broad_cell_type"
+    cell_type_classification_key = (
+        "medium_cell_type"
+        if "medium_cell_type" in []  # placeholder, fixed after loading TRAIN
+        else "broad_cell_type"
+    )
 
     full_config = {
         "train_mdata_path": args.train_mdata_path,
@@ -544,7 +538,8 @@ def main():
         "mapping_csv": args.mapping_csv,
         "impute_batch_size": args.impute_batch_size,
         "evals": list(EVALS),
-        "umap_top_n_celltypes": TOP_N_CT,
+        "umap_top_n_celltypes": args.umap_top_n_celltypes,
+        "umap_obs_keys": args.umap_obs_keys,
     }
 
     if args.use_wandb:
@@ -585,6 +580,9 @@ def main():
 
     print(f"[DATA] Loading TRAIN MuData from {args.train_mdata_path} ...")
     mdata_train = mu.read_h5mu(args.train_mdata_path, backed="r")
+    print(f"[DATA] TRAIN MuData loaded with mods: {list(mdata_train.mod.keys())}")
+    print(f"[DATA] TRAIN 'rna' n_obs: {mdata_train['rna'].n_obs}, n_vars: {mdata_train['rna'].n_vars}")
+
     if args.mapping_csv is not None:
         apply_obs_mapping_from_csv(mdata_train, args.mapping_csv)
 
@@ -599,6 +597,7 @@ def main():
 
     # Library size
     if "X_library_size" in mdata_train["rna"].obsm_keys():
+        print("[DATA] Copying TRAIN RNA 'X_library_size' from .obsm to .obs...")
         mdata_train["rna"].obs["X_library_size"] = mdata_train["rna"].obsm["X_library_size"]
 
     print("[MODEL] Setting up SPLICEVI on TRAIN MuData ...")
@@ -616,6 +615,7 @@ def main():
 
     print(f"[MODEL] Loading SPLICEVI model from {args.model_dir} ...")
     model = SPLICEVI.load(args.model_dir, adata=mdata_train)
+    print("[MODEL] Model loaded. Showing anndata setup:")
     model.view_anndata_setup()
 
     if run is not None:
@@ -629,82 +629,110 @@ def main():
         print(f"[MODEL] Total model parameters: {total_params:,}")
         wandb.log({"total_parameters": total_params})
 
-    # Basic shared keys
-    umap_color_key = "broad_cell_type"
+    # Decide classification and UMAP default keys now that TRAIN obs is available
+    umap_color_key = "broad_cell_type" if "broad_cell_type" in mdata_train.obs.columns else "tissue"
     cell_type_classification_key = (
         "medium_cell_type"
-        if "medium_cell_type" in mdata_train.obs
-        else "broad_cell_type"
+        if "medium_cell_type" in mdata_train.obs.columns
+        else umap_color_key
     )
 
-    # -----------------------------------------------------------------
-    # UMAP evaluation (TRAIN)
-    # -----------------------------------------------------------------
+    # UMAP obs keys list
+    if args.umap_obs_keys is not None:
+        umap_obs_keys = args.umap_obs_keys
+        print(f"[UMAP] Using user-provided UMAP obs keys: {umap_obs_keys}")
+    else:
+        umap_obs_keys = [umap_color_key]
+        if cell_type_classification_key != umap_color_key:
+            umap_obs_keys.append(cell_type_classification_key)
+        print(f"[UMAP] UMAP obs keys not provided; using defaults: {umap_obs_keys}")
+
+    # Latent spaces
+    print("[MODEL] Computing latent representations on TRAIN for UMAP...")
     latent_spaces_train = {
         "joint": model.get_latent_representation(),
         "expression": model.get_latent_representation(modality="expression"),
         "splicing": model.get_latent_representation(modality="splicing"),
     }
+    for name, Z in latent_spaces_train.items():
+        print(f"[MODEL] TRAIN latent '{name}' shape: {Z.shape}")
 
+    # -----------------------------------------------------------------
+    # UMAP evaluation (TRAIN)
+    # -----------------------------------------------------------------
     if "umap" in EVALS:
-        print("[EVAL/UMAP] Computing latent UMAPs on TRAIN...")
+        print("[EVAL/UMAP] Starting UMAP evaluation on TRAIN...")
+        print(f"[EVAL/UMAP] Will compute UMAPs for latent spaces: {list(latent_spaces_train.keys())}")
+        print(f"[EVAL/UMAP] Will color UMAPs by obs keys: {umap_obs_keys}")
 
-        # top-N handling for both label columns
-        color_specs = {}
-        for col in [umap_color_key, cell_type_classification_key]:
-            plot_col, top_cts, palette = make_topn_categorical(
-                mdata_train["rna"], col, TOP_N_CT
-            )
-            color_specs[col] = dict(
-                plot_col=plot_col,
-                top_cts=top_cts,
-                palette=palette,
-            )
-
-        for name, Z in latent_spaces_train.items():
+        for name, Z in tqdm(
+            latent_spaces_train.items(),
+            desc="[EVAL/UMAP] Latent spaces",
+        ):
             key_latent = f"X_latent_{name}"
             key_nn = f"neighbors_{name}"
             key_umap = f"X_umap_{name}"
 
-            print(f"[EVAL/UMAP] Neighbors/UMAP for latent space: {name}")
+            print(f"[EVAL/UMAP] Working on latent space '{name}'...")
+            print(f"[EVAL/UMAP] Storing latent in .obsm['{key_latent}']...")
             mdata_train["rna"].obsm[key_latent] = Z
-            sc.pp.neighbors(mdata_train["rna"], use_rep=key_latent, key_added=key_nn)
+
+            print(f"[EVAL/UMAP] Computing neighbors for '{name}'...")
+            sc.pp.neighbors(
+                mdata_train["rna"],
+                use_rep=key_latent,
+                key_added=key_nn,
+            )
+
+            print(f"[EVAL/UMAP] Computing UMAP embedding for '{name}'...")
             sc.tl.umap(mdata_train["rna"], min_dist=0.1, neighbors_key=key_nn)
             mdata_train["rna"].obsm[key_umap] = mdata_train["rna"].obsm["X_umap"]
 
-            cols_to_plot = [umap_color_key]
-            if cell_type_classification_key != umap_color_key:
-                cols_to_plot.append(cell_type_classification_key)
+            # Plot UMAPs for all requested obs keys
+            for obs_key in tqdm(
+                umap_obs_keys,
+                desc=f"[EVAL/UMAP] Plotting colors for '{name}'",
+                leave=False,
+            ):
+                if obs_key not in mdata_train["rna"].obs.columns:
+                    print(
+                        f"[EVAL/UMAP] WARNING: obs key '{obs_key}' not found in TRAIN RNA. Skipping."
+                    )
+                    continue
 
-            for col in cols_to_plot:
-                c_spec = color_specs[col]
-                top_count = (
-                    len(c_spec["top_cts"]) if c_spec["top_cts"] is not None else "all"
+                print(
+                    f"[EVAL/UMAP] Plotting TRAIN UMAP for latent '{name}' colored by '{obs_key}'..."
                 )
 
-                plt.figure(figsize=(8, 5))
+                fig, ax = plt.subplots(figsize=(7, 7))
+                ax.set_aspect("equal")
+
                 sc.pl.embedding(
                     mdata_train["rna"],
                     basis=key_umap,
-                    color=c_spec["plot_col"],
-                    palette=c_spec["palette"],
+                    color=obs_key,
                     show=False,
                     frameon=True,
-                    legend_loc="right margin",
                     legend_fontsize=10,
-                    title=None,
+                    legend_loc="right margin",
+                    ax=ax,
                 )
 
-                plt.title(f"TRAIN UMAP by {col} (Top {top_count} highlighted)")
-                plt.tight_layout(rect=[0, 0, 1, 0.95])
+                ax.set_aspect("equal")
+                title = f"TRAIN UMAP ({name}) colored by {obs_key}"
+                plt.title(title)
+                plt.tight_layout()
 
-                out_path = (
-                    f"{args.fig_dir}/train_umap_{col}_{name}_top{top_count}.png"
+                safe_obs = re.sub(r"[^A-Za-z0-9]+", "_", obs_key)
+                out_path = os.path.join(
+                    args.fig_dir, f"train_umap_{name}_{safe_obs}.png"
                 )
                 plt.savefig(out_path, dpi=300, bbox_inches="tight")
+                print(f"[EVAL/UMAP] Saved UMAP to {out_path}")
                 if run is not None:
-                    wandb.log({f"umap/{col}_{name}_train": wandb.Image(out_path)})
-                plt.close()
+                    wandb.log({f"umap/train_{name}_{safe_obs}": wandb.Image(out_path)})
+
+                plt.close(fig)
 
         print("[EVAL/UMAP] All TRAIN UMAPs complete.")
     else:
@@ -717,7 +745,6 @@ def main():
 
     if "clustering" in EVALS:
         print("[EVAL/CLUSTER] Running Leiden clustering and consistency metrics...")
-
         cell_type_col = "broad_cell_type"
         if "medium_cell_type" in mdata_train["rna"].obs:
             cell_type_col = "medium_cell_type"
@@ -735,14 +762,18 @@ def main():
         spaces_order = ["expression", "splicing", "joint"]
         leiden_keys = {}
 
+        print("[EVAL/CLUSTER] Running Leiden clustering per latent space...")
         for name in ["joint", "expression", "splicing"]:
             basis_key = f"X_latent_{name}"
             neigh_key = f"neighbors_{name}_leiden"
             leiden_key = f"leiden_{name}"
+
+            print(f"[EVAL/CLUSTER] Clustering in space '{name}'...")
             run_leiden_on_basis(mdata_train["rna"], basis_key, neigh_key, leiden_key)
             leiden_keys[name] = leiden_key
 
             n_cl = int(mdata_train["rna"].obs[leiden_key].nunique())
+            print(f"[EVAL/CLUSTER] '{name}' produced {n_cl} clusters.")
             if run is not None:
                 wandb.log({f"clustering/{name}_leiden_n_clusters": n_cl})
 
@@ -753,6 +784,10 @@ def main():
             )
             n_unique = sum(1 for s in cts_per_cluster.values if len(s) == 1)
             n_multi = sum(1 for s in cts_per_cluster.values if len(s) > 1)
+
+            print(
+                f"[EVAL/CLUSTER] '{name}': {n_unique} clusters map to a single cell type, {n_multi} span multiple types."
+            )
 
             if run is not None:
                 wandb.log(
@@ -777,7 +812,8 @@ def main():
                 }
             )
 
-            plt.figure(figsize=(6, 6))
+            # Plot joint UMAP colored by Leiden labels for each space
+            plt.figure(figsize=(8, 6))
             sc.pl.embedding(
                 mdata_train["rna"],
                 basis="X_umap_joint",
@@ -787,11 +823,12 @@ def main():
                 show=False,
             )
             plt.title(f"TRAIN joint UMAP colored by Leiden ({name})")
-            plt.tight_layout(rect=[0, 0, 1, 0.95])
+            plt.tight_layout()
             out_path = (
                 f"{args.fig_dir}/train_umap_joint_colored_by_{name}_leiden.png"
             )
             plt.savefig(out_path, dpi=300, bbox_inches="tight")
+            print(f"[EVAL/CLUSTER] Saved cluster UMAP: {out_path}")
             if run is not None:
                 wandb.log(
                     {
@@ -803,10 +840,12 @@ def main():
             plt.close()
 
         # Bar plot: subclusters per cell type
+        print("[EVAL/CLUSTER] Building bar plot: subclusters per top-20 cell types...")
         cell_type_for_bars = cell_type_col
         obs = mdata_train["rna"].obs
         ct_counts = obs[cell_type_for_bars].value_counts()
         top20_cts = ct_counts.head(20).index.tolist()
+        print(f"[EVAL/CLUSTER] Top 20 cell types: {top20_cts}")
 
         records_sub = []
         for space_name, leiden_key in leiden_keys.items():
@@ -844,6 +883,7 @@ def main():
         plt.tight_layout()
         out_path = f"{args.fig_dir}/train_bar_subclusters_top20_{cell_type_for_bars}_leiden_res_{LEIDEN_RESOLUTION}.png"
         plt.savefig(out_path, dpi=300, bbox_inches="tight")
+        print(f"[EVAL/CLUSTER] Saved bar plot of subclusters: {out_path}")
         if run is not None:
             wandb.log({"clustering/train_bar_subclusters_top20": wandb.Image(out_path)})
         plt.close()
@@ -869,6 +909,7 @@ def main():
             f"{args.fig_dir}/train_clusters_exclusive_vs_multi_by_space.png"
         )
         plt.savefig(out_path, dpi=300, bbox_inches="tight")
+        print(f"[EVAL/CLUSTER] Saved exclusivity plot: {out_path}")
         if run is not None:
             wandb.log(
                 {
@@ -880,6 +921,7 @@ def main():
         plt.close()
 
         # Pairwise same-cluster consistency
+        print("[EVAL/CLUSTER] Computing pairwise same-cluster consistency...")
         pairs = [("expression", "joint"), ("splicing", "joint"), ("expression", "splicing")]
 
         n_cells = mdata_train["rna"].n_obs
@@ -895,6 +937,7 @@ def main():
 
         heat_records = []
         for a, b in pairs:
+            print(f"[EVAL/CLUSTER] Computing consistency for {a} vs {b}...")
             labs_a, mem_a = cluster_members[a]
             labs_b, mem_b = cluster_members[b]
 
@@ -916,6 +959,9 @@ def main():
 
             mean_ov = float(np.nanmean(overlap))
             median_ov = float(np.nanmedian(overlap))
+            print(
+                f"[EVAL/CLUSTER] {a} vs {b} mean overlap: {mean_ov:.4f}, median: {median_ov:.4f}"
+            )
             if run is not None:
                 wandb.log(
                     {
@@ -964,6 +1010,7 @@ def main():
             index="pair_label", columns="pair", values="pct_consistent"
         ).fillna(0.0)
 
+        print("[EVAL/CLUSTER] Plotting clustermap of percent consistent clusters...")
         plt.close("all")
         g = sns.clustermap(
             heat_pivot,
@@ -987,6 +1034,7 @@ def main():
         )
         out_path = f"{args.fig_dir}/train_clustermap_pct_consistent_leiden_res_{LEIDEN_RESOLUTION}.png"
         g.figure.savefig(out_path, dpi=300, bbox_inches="tight")
+        print(f"[EVAL/CLUSTER] Saved clustermap: {out_path}")
         if run is not None:
             wandb.log(
                 {"clustering/train_clustermap_pct_consistent": wandb.Image(out_path)}
@@ -994,11 +1042,13 @@ def main():
         plt.close(g.figure)
 
         # AMI
+        print("[EVAL/CLUSTER] Computing adjusted mutual information between clusterings...")
         for a, b in pairs:
             ami = adjusted_mutual_info_score(
                 mdata_train["rna"].obs[leiden_keys[a]].values,
                 mdata_train["rna"].obs[leiden_keys[b]].values,
             )
+            print(f"[EVAL/CLUSTER] AMI {a} vs {b}: {ami:.4f}")
             if run is not None:
                 wandb.log({f"clustering/{a}_vs_{b}_AMI": float(ami)})
 
@@ -1011,6 +1061,7 @@ def main():
     # Train / Test latent evaluation
     # -----------------------------------------------------------------
     if "train_eval" in EVALS:
+        print("[EVAL/TRAIN] Starting train-split latent quality evaluation...")
         evaluate_split(
             "train",
             mdata_train,
@@ -1051,10 +1102,14 @@ def main():
     # -----------------------------------------------------------------
     print(f"[DATA] Loading TEST MuData from {args.test_mdata_path} ...")
     mdata_test = mu.read_h5mu(args.test_mdata_path, backed="r")
+    print(f"[DATA] TEST MuData loaded with mods: {list(mdata_test.mod.keys())}")
+    print(f"[DATA] TEST 'rna' n_obs: {mdata_test['rna'].n_obs}, n_vars: {mdata_test['rna'].n_vars}")
+
     if args.mapping_csv is not None:
         apply_obs_mapping_from_csv(mdata_test, args.mapping_csv)
 
     if "X_library_size" in mdata_test["rna"].obsm_keys():
+        print("[DATA] Copying TEST RNA 'X_library_size' from .obsm to .obs...")
         mdata_test["rna"].obs["X_library_size"] = mdata_test["rna"].obsm["X_library_size"]
 
     print("[MODEL] Setting up SPLICEVI on TEST MuData ...")
@@ -1071,6 +1126,7 @@ def main():
     )
 
     if "test_eval" in EVALS:
+        print("[EVAL/TEST] Starting test-split latent quality evaluation...")
         evaluate_split(
             "test",
             mdata_test,
@@ -1103,16 +1159,16 @@ def main():
 
     # Age R² CSV dump
     if "age_r2_heatmap" in EVALS:
+        print("[EVAL/AGE] Writing age R² CSV if any records exist...")
         if len(AGE_R2_RECORDS) > 0:
             age_df = pd.DataFrame(AGE_R2_RECORDS)
             csv_path = f"{args.fig_dir}/age_r2_by_tissue_celltype_train_test.csv"
             age_df.to_csv(csv_path, index=False)
+            print(
+                f"[EVAL/AGE] Wrote age R² records to {csv_path} ({age_df.shape[0]} rows)."
+            )
             if run is not None:
                 wandb.log({"age_r2/records_csv_path": csv_path})
-            print(
-                f"[EVAL/AGE] Wrote age R² records to {csv_path} "
-                f"({age_df.shape[0]} rows)."
-            )
         else:
             print("[EVAL/AGE] No age R² pairing records collected; skipping CSV.")
     else:
@@ -1129,7 +1185,11 @@ def main():
         if not args.masked_test_mdata_paths:
             print("[EVAL/IMPUTE] No masked_test_mdata_paths provided. Skipping.")
         else:
-            for masked_path in args.masked_test_mdata_paths:
+            print("[EVAL/IMPUTE] Starting masked imputation on provided TEST files...")
+            for masked_path in tqdm(
+                args.masked_test_mdata_paths,
+                desc="[EVAL/IMPUTE] Masked TEST files",
+            ):
                 fname = os.path.basename(masked_path)
                 m = re.search(
                     r"(\d+)\s*%|MASKED[_-]?(\d+)", fname, flags=re.IGNORECASE
@@ -1143,20 +1203,26 @@ def main():
                     )[:40]
 
                 print(
-                    f"\n[EVAL/IMPUTE] Masked-ATSE imputation on TEST using {masked_path} ({tag})"
+                    f"\n[EVAL/IMPUTE] Masked-ATSE imputation on TEST using {masked_path} (tag={tag})"
                 )
                 mdata_masked = mu.read_h5mu(masked_path, backed="r")
+                print(
+                    f"[EVAL/IMPUTE/{tag}] Masked MuData loaded. 'rna' n_obs: {mdata_masked['rna'].n_obs}"
+                )
                 if args.mapping_csv is not None:
                     apply_obs_mapping_from_csv(mdata_masked, args.mapping_csv)
 
                 ad_masked = mdata_masked["splicing"]
 
                 if "X_library_size" in mdata_masked["rna"].obsm_keys():
+                    print(
+                        f"[EVAL/IMPUTE/{tag}] Copying RNA 'X_library_size' from .obsm to .obs..."
+                    )
                     mdata_masked["rna"].obs["X_library_size"] = mdata_masked["rna"].obsm[
                         "X_library_size"
                     ]
 
-                print("[EVAL/IMPUTE] Setting up SPLICEVI on masked MuData...")
+                print(f"[EVAL/IMPUTE/{tag}] Setting up SPLICEVI on masked MuData...")
                 SPLICEVI.setup_mudata(
                     mdata_masked,
                     batch_key=None,
@@ -1169,7 +1235,7 @@ def main():
                     modalities={"rna_layer": "rna", "junc_ratio_layer": "splicing"},
                 )
 
-                print("[EVAL/IMPUTE] Running PSI imputation and computing metrics...")
+                print(f"[EVAL/IMPUTE/{tag}] Running PSI imputation and computing metrics...")
                 model.module.eval()
 
                 masked_orig = ad_masked.layers["junc_ratio_masked_original"]
@@ -1181,22 +1247,25 @@ def main():
                     bin_mask = sparse.csr_matrix(bin_mask)
 
                 n_cells = bin_mask.shape[0]
-                # New behavior: if impute_batch_size == -1, do one big batch
                 if args.impute_batch_size == -1:
                     bs = n_cells if n_cells > 0 else 1
                     print(
-                        f"[EVAL/IMPUTE] impute_batch_size = -1, processing all {n_cells} cells in one batch."
+                        f"[EVAL/IMPUTE/{tag}] impute_batch_size = -1, processing all {n_cells} cells in one batch."
                     )
                 else:
                     bs = args.impute_batch_size
                     print(
-                        f"[EVAL/IMPUTE] Using mini-batch size {bs} for masked imputation."
+                        f"[EVAL/IMPUTE/{tag}] Using mini-batch size {bs} for masked imputation."
                     )
 
                 orig_all, pred_all = [], []
                 pairs_total = 0
 
-                for start in range(0, n_cells, bs):
+                for start in tqdm(
+                    range(0, n_cells, bs),
+                    desc=f"[EVAL/IMPUTE/{tag}] Batches",
+                    leave=False,
+                ):
                     stop = min(start + bs, n_cells)
                     submask = bin_mask[start:stop]
                     sub_r, sub_c = submask.nonzero()
@@ -1212,9 +1281,9 @@ def main():
                             batch_size=bs,
                         )
 
-                    orig_vals_b = masked_orig[start:stop][:, sub_c][
-                        sub_r, np.arange(sub_r.size)
-                    ].A1
+                    # Extract original and predicted values only at masked locations
+                    masked_sub = masked_orig[start:stop][:, sub_c]
+                    orig_vals_b = masked_sub[sub_r, np.arange(sub_r.size)].A1
                     pred_vals_b = decoded_batch[sub_r, sub_c]
 
                     orig_all.append(orig_vals_b.astype(np.float32, copy=False))
@@ -1265,6 +1334,7 @@ def main():
                             }
                         )
 
+                print(f"[EVAL/IMPUTE/{tag}] Cleaning up masked MuData from memory...")
                 del (
                     mdata_masked,
                     ad_masked,
