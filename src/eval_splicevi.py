@@ -1,0 +1,1296 @@
+#!/usr/bin/env python
+"""
+eval_multivisplice_basic.py
+
+Evaluation-only pipeline for SPLICEVI:
+
+1. Load TRAIN and TEST MuData from disk
+2. Load a trained SPLICEVI model from disk
+3. Run a configurable subset of evaluation blocks:
+   - UMAPs
+   - Unsupervised clustering + cluster consistency
+   - Train split latent quality metrics
+   - Test split latent quality metrics
+   - Age R² aggregation + CSV
+   - Masked-ATSE imputation on multiple masked TEST files
+
+4. Save figures under a user-specified output directory
+
+W&B logging is optional and controlled via CLI flags (typically from a shell script).
+"""
+
+import os
+import argparse
+from typing import Tuple, Optional, List, Dict
+
+import scanpy as sc
+import scvi
+import mudata as mu
+import numpy as np
+import pandas as pd
+import torch
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression, RidgeCV
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    silhouette_score,
+    adjusted_mutual_info_score,
+)
+from sklearn.preprocessing import StandardScaler
+from scipy import sparse
+from scipy.stats import spearmanr
+
+from splicevi import SPLICEVI
+
+import gc
+import re
+
+
+# ---------------------------------------------------------------------
+# W&B helper
+# ---------------------------------------------------------------------
+def maybe_import_wandb():
+    """Import wandb if available; otherwise return (None)."""
+    try:
+        import wandb
+    except ImportError:
+        wandb = None
+    return wandb
+
+
+# ---------------------------------------------------------------------
+# obs mapping helper
+# ---------------------------------------------------------------------
+_MAPPING_DF = None  # global cache
+
+
+def apply_obs_mapping_from_csv(mdata, mapping_csv: str):
+    """
+    Overwrite selected obs fields on mdata, mdata['rna'], and mdata['splicing']
+    using a mapping CSV with one row per cell.
+
+    Expected columns in the mapping CSV (your file had e.g.):
+        'cell_id', 'cell_name', 'cell_ontology_class',
+        'broad_cell_type', 'medium_cell_type', 'tissue', 'tissue_celltype'
+
+    Matching strategy:
+      1. If CSV has 'cell_name' and mdata.obs has 'cell_name', join on that.
+      2. Else if CSV has 'cell_id' and mdata.obs has 'cell_id', join on that.
+      3. Else, assume mdata.obs.index matches CSV['cell_id'].
+    """
+    global _MAPPING_DF
+
+    if mapping_csv is None:
+        print("[obs-mapping] No mapping CSV provided; skipping mapping.")
+        return
+
+    if _MAPPING_DF is None:
+        print(f"[obs-mapping] Loading mapping from {mapping_csv}")
+        _MAPPING_DF = pd.read_csv(mapping_csv)
+
+    df = _MAPPING_DF.copy()
+
+    # Decide join key
+    join_on = None
+    if "cell_name" in df.columns and "cell_name" in mdata.obs.columns:
+        join_on = "cell_name"
+    elif "cell_id" in df.columns and "cell_id" in mdata.obs.columns:
+        join_on = "cell_id"
+    else:
+        # Fallback: assume index == cell_id
+        if "cell_id" not in df.columns:
+            raise ValueError(
+                "[obs-mapping] Could not find a suitable join key. "
+                "Need 'cell_name' or 'cell_id' in both mapping CSV and mdata.obs/index."
+            )
+        df = df.set_index("cell_id")
+        mapping_idx = df.index
+        common = mdata.obs.index.intersection(mapping_idx)
+        if len(common) == 0:
+            raise ValueError(
+                "[obs-mapping] No overlap between mdata.obs.index and mapping CSV 'cell_id'."
+            )
+
+        print(
+            f"[obs-mapping] Using mdata.obs.index ↔ CSV['cell_id'] "
+            f"(overlap {len(common)}/{mdata.n_obs})"
+        )
+
+        df_reindexed = df.reindex(mdata.obs.index)
+        for col in df_reindexed.columns:
+            vals = df_reindexed[col].values
+            mdata.obs[col] = vals
+            if "rna" in mdata.mod:
+                mdata["rna"].obs[col] = vals
+            if "splicing" in mdata.mod:
+                mdata["splicing"].obs[col] = vals
+
+        missing = df_reindexed.isna().all(axis=1).sum()
+        if missing > 0:
+            print(
+                f"[obs-mapping] WARNING: {missing} cells had no mapping row in CSV (all NaN)."
+            )
+        return
+
+    # If we’re here, we have an explicit join_on column
+    print(f"[obs-mapping] Joining on '{join_on}'")
+
+    df = df.set_index(join_on)
+
+    if join_on not in mdata.obs.columns:
+        raise ValueError(
+            f"[obs-mapping] Expected '{join_on}' in mdata.obs but it is missing."
+        )
+
+    key_vals = mdata.obs[join_on].astype(str)
+    mapping_idx = df.index.astype(str)
+
+    common = pd.Index(key_vals).intersection(mapping_idx)
+    if len(common) == 0:
+        raise ValueError(
+            f"[obs-mapping] No overlap between mdata.obs['{join_on}'] "
+            f"and CSV['{join_on}']."
+        )
+
+    print(
+        f"[obs-mapping] Found {len(common)}/{mdata.n_obs} cells with mapping for '{join_on}'"
+    )
+
+    df_reindexed = df.reindex(key_vals)
+    for col in df_reindexed.columns:
+        vals = df_reindexed[col].values
+        mdata.obs[col] = vals
+        if "rna" in mdata.mod:
+            mdata["rna"].obs[col] = vals
+        if "splicing" in mdata.mod:
+            mdata["splicing"].obs[col] = vals
+
+    missing = df_reindexed.isna().all(axis=1).sum()
+    if missing > 0:
+        print(
+            f"[obs-mapping] WARNING: {missing} cells had no mapping row in CSV (all NaN)."
+        )
+
+
+# ---------------------------------------------------------------------
+# UMAP helper: top-N cell types
+# ---------------------------------------------------------------------
+def make_topn_categorical(
+    ad,
+    col: str,
+    top_n: Optional[int],
+) -> Tuple[str, Optional[List[str]], Optional[Dict[str, str]]]:
+    """
+    For a categorical column `col` in ad.obs:
+      - If top_n is None or <= 0: return (col, None, None) and do nothing.
+      - Else: create a new column <col>_topN where only the top_n most frequent
+        categories retain their labels; all others become 'Other'.
+
+    Returns:
+      new_col_name, list_of_top_categories, palette_dict (category -> color) or None.
+    """
+    if top_n is None or top_n <= 0:
+        return col, None, None
+
+    if col not in ad.obs.columns:
+        raise KeyError(f"[topN] Column '{col}' not found in ad.obs.")
+
+    vc = ad.obs[col].value_counts()
+    top = vc.index.to_list()[:top_n]
+
+    new_col = f"{col}_top{top_n}"
+    ad.obs[new_col] = ad.obs[col].where(ad.obs[col].isin(top), other="Other")
+
+    cats = list(dict.fromkeys(top + ["Other"]))
+    base_colors = sc.pl.palettes.default_20
+
+    if len(cats) > len(base_colors):
+        raise ValueError(
+            f"[topN] Need {len(cats)} colors but default palette has only "
+            f"{len(base_colors)}. Reduce --umap_top_n_celltypes or extend the palette."
+        )
+
+    palette = {ct: base_colors[i] for i, ct in enumerate(top)}
+    palette["Other"] = "lightgray"
+
+    return new_col, top, palette
+
+
+# ---------------------------------------------------------------------
+# Evaluation helper: train/test split metrics
+# ---------------------------------------------------------------------
+AGE_R2_RECORDS = []
+MIN_GROUP_N = 25  # minimum cells per tissue | celltype group
+
+
+def evaluate_split(
+    name: str,
+    mdata,
+    model,
+    umap_color_key: str,
+    cell_type_classification_key: str,
+    Z_type: str = "joint",
+    wandb=None,
+):
+    """
+    Latent-quality evaluation for TRAIN / TEST splits:
+      - PCA 90% variance
+      - silhouette scores (broad & medium)
+      - LR classification on medium cell type
+      - Age R² overall + per tissue|celltype group
+    """
+    print(f"\n=== Evaluating {name.upper()}-{Z_type} split ===")
+    Z = model.get_latent_representation(adata=mdata, modality=Z_type)
+
+    # PCA 90% variance
+    n_comp_max = min(Z.shape[0], Z.shape[1])
+    pca = PCA(n_components=n_comp_max, svd_solver="full").fit(Z)
+    cum_var = np.cumsum(pca.explained_variance_ratio_)
+    pcs_90 = int(np.searchsorted(cum_var, 0.90) + 1)
+    print(f"[{name}-{Z_type}] PCs for 90% variance: {pcs_90}/{Z.shape[1]}")
+
+    if wandb is not None:
+        wandb.log(
+            {
+                f"real-{name}-{Z_type}/pca_n_components_90var": pcs_90,
+                f"real-{name}-{Z_type}/pca_total_dim": Z.shape[1],
+                f"real-{name}-{Z_type}/pca_var90_ratio": pcs_90 / Z.shape[1],
+            }
+        )
+
+    # Silhouette scores
+    labels_broad = mdata.obs[umap_color_key].astype(str).values
+    sil_broad = silhouette_score(Z, labels_broad)
+    labels_med = mdata.obs[cell_type_classification_key].astype(str).values
+    sil_med = silhouette_score(Z, labels_med)
+
+    if wandb is not None:
+        wandb.log(
+            {
+                f"real-{name}-{Z_type}/{umap_color_key}-silhouette_score": sil_broad,
+                f"real-{name}-{Z_type}/{cell_type_classification_key}-silhouette_score": sil_med,
+            }
+        )
+
+    # LR classification on medium cell type
+    Z_tr, Z_ev, y_tr, y_ev = train_test_split(
+        Z, labels_med, test_size=0.2, random_state=0
+    )
+    clf = LogisticRegression(max_iter=1000).fit(Z_tr, y_tr)
+    y_pred = clf.predict(Z_ev)
+
+    if wandb is not None:
+        wandb.log(
+            {
+                f"real-{name}-{Z_type}/accuracy": accuracy_score(y_ev, y_pred),
+                f"real-{name}-{Z_type}/precision": precision_score(
+                    y_ev, y_pred, average="weighted", zero_division=0
+                ),
+                f"real-{name}-{Z_type}/recall": recall_score(
+                    y_ev, y_pred, average="weighted", zero_division=0
+                ),
+                f"real-{name}-{Z_type}/f1_score": f1_score(
+                    y_ev, y_pred, average="weighted", zero_division=0
+                ),
+            }
+        )
+
+    # Age regression tasks
+    if "age_numeric" in mdata.obs:
+        ages_full = mdata.obs["age_numeric"].astype(float).values
+        target_ages = np.array([3.0, 18.0, 24.0], dtype=float)
+        mask_age = np.isin(ages_full, target_ages)
+        n_kept = int(mask_age.sum())
+        print(f"[{name}-{Z_type}] Kept {n_kept}/{len(mask_age)} cells at ages {target_ages.tolist()}")
+
+        if n_kept < MIN_GROUP_N:
+            print(
+                f"[{name}-{Z_type}] Only {n_kept} cells with target ages; skipping age R² tasks."
+            )
+            return
+
+        ages = ages_full[mask_age]
+        Z_use = Z[mask_age, :]
+        obs_local = mdata.obs.iloc[np.where(mask_age)[0]].copy()
+
+        X_latent = StandardScaler().fit_transform(Z_use)
+        X_tr, X_ev, y_tr, y_ev = train_test_split(
+            X_latent, ages, test_size=0.2, random_state=0
+        )
+
+        # Global R²
+        if np.std(y_tr) == 0.0 or np.std(y_ev) == 0.0:
+            print(
+                f"[{name}-{Z_type}] Degenerate age variance after filtering; skipping global age R²."
+            )
+        else:
+            ridge = RidgeCV(alphas=np.logspace(-2, 3, 20), cv=5).fit(X_tr, y_tr)
+            r2_age = ridge.score(X_ev, y_ev)
+            if wandb is not None:
+                wandb.log(
+                    {
+                        f"real-{name}-{Z_type}/age_r2": r2_age,
+                        f"real-{name}-{Z_type}/age_n_cells": n_kept,
+                    }
+                )
+
+        # Per (tissue | cell_type) R²
+        if "tissue" in obs_local:
+            ct_key = cell_type_classification_key
+            tissue_series = obs_local["tissue"].astype(str)
+            ct_series = obs_local[ct_key].astype(str)
+            pair = tissue_series + " | " + ct_series
+            pair_unique = pair.unique()
+
+            for p in pair_unique:
+                idx = np.where(pair.values == p)[0]
+                if idx.size < MIN_GROUP_N:
+                    continue
+
+                Zg = X_latent[idx]
+                yg = ages[idx]
+
+                if np.std(yg) == 0.0:
+                    continue
+
+                Ztr, Zev, ytr, yev = train_test_split(
+                    Zg, yg, test_size=0.2, random_state=0
+                )
+                if (
+                    Ztr.shape[0] < 2
+                    or Zev.shape[0] < 2
+                    or np.std(ytr) == 0.0
+                    or np.std(yev) == 0.0
+                ):
+                    continue
+
+                try:
+                    rg = RidgeCV(alphas=np.logspace(-2, 3, 20), cv=5).fit(Ztr, ytr)
+                    r2g = rg.score(Zev, yev)
+                except Exception:
+                    continue
+
+                AGE_R2_RECORDS.append(
+                    {
+                        "dataset": name,
+                        "space": Z_type,
+                        "pair": p,
+                        "tissue": p.split(" | ", 1)[0],
+                        "cell_type": p.split(" | ", 1)[1],
+                        "r2": float(r2g),
+                        "n": int(idx.size),
+                    }
+                )
+
+
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
+def build_argparser():
+    parser = argparse.ArgumentParser(
+        "eval_multivisplice_basic",
+        description=(
+            "Eval-only script for SPLICEVI: loads a trained model and MuData, "
+            "then runs UMAPs, clustering, latent metrics, and masked imputation."
+        ),
+    )
+
+    # Core paths
+    parser.add_argument(
+        "--train_mdata_path",
+        type=str,
+        required=True,
+        help="Path to TRAIN MuData (.h5mu) used during training.",
+    )
+    parser.add_argument(
+        "--test_mdata_path",
+        type=str,
+        required=True,
+        help="Path to TEST MuData (.h5mu) for evaluation.",
+    )
+    parser.add_argument(
+        "--model_dir",
+        type=str,
+        required=True,
+        help="Directory containing the trained SPLICEVI model.",
+    )
+    parser.add_argument(
+        "--fig_dir",
+        type=str,
+        required=True,
+        help="Directory to save figures and CSV outputs.",
+    )
+
+    parser.add_argument(
+        "--masked_test_mdata_paths",
+        nargs="+",
+        default=[],
+        help="Optional: one or more masked TEST MuData .h5mu paths for ATSE imputation.",
+    )
+
+    parser.add_argument(
+        "--mapping_csv",
+        type=str,
+        default=None,
+        help="Optional: path to tissue/cell-type mapping CSV to overwrite obs fields.",
+    )
+
+    # Imputation batch size: -1 means "no batching" (single batch of all cells)
+    parser.add_argument(
+        "--impute_batch_size",
+        type=int,
+        default=512,
+        help=(
+            "Batch size for masked imputation. "
+            "If set to -1, process all cells in a single batch (no mini-batching)."
+        ),
+    )
+
+    # UMAP settings
+    parser.add_argument(
+        "--umap_top_n_celltypes",
+        type=int,
+        default=None,
+        help=(
+            "If set, UMAP legends will highlight only the top N cell types by frequency; "
+            "all others are merged into 'Other' and shown in gray."
+        ),
+    )
+
+    # Which eval blocks to run
+    parser.add_argument(
+        "--evals",
+        nargs="+",
+        default=[
+            "umap",
+            "clustering",
+            "train_eval",
+            "test_eval",
+            "age_r2_heatmap",
+            "masked_impute",
+        ],
+        help=(
+            "Which eval blocks to run. Choices among: "
+            "umap, clustering, train_eval, test_eval, age_r2_heatmap, masked_impute"
+        ),
+    )
+
+    # Optional W&B integration
+    parser.add_argument(
+        "--use_wandb",
+        action="store_true",
+        help="Enable Weights & Biases logging for evaluation.",
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default=None,
+        help="W&B project name (required if --use_wandb).",
+    )
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="Optional W&B entity (team) name.",
+    )
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="Optional W&B run name.",
+    )
+    parser.add_argument(
+        "--wandb_group",
+        type=str,
+        default=None,
+        help="Optional W&B group name.",
+    )
+    parser.add_argument(
+        "--wandb_log_freq",
+        type=int,
+        default=1000,
+        help="Logging frequency for wandb.watch (in training steps).",
+    )
+
+    return parser
+
+
+def main():
+    parser = build_argparser()
+    args = parser.parse_args()
+    EVALS = set(args.evals)
+    TOP_N_CT = args.umap_top_n_celltypes
+
+    os.makedirs(args.fig_dir, exist_ok=True)
+
+    # W&B
+    wandb = maybe_import_wandb()
+    run = None
+
+    full_config = {
+        "train_mdata_path": args.train_mdata_path,
+        "test_mdata_path": args.test_mdata_path,
+        "model_dir": args.model_dir,
+        "fig_dir": args.fig_dir,
+        "masked_test_mdata_paths": args.masked_test_mdata_paths,
+        "mapping_csv": args.mapping_csv,
+        "impute_batch_size": args.impute_batch_size,
+        "evals": list(EVALS),
+        "umap_top_n_celltypes": TOP_N_CT,
+    }
+
+    if args.use_wandb:
+        if wandb is None:
+            raise ImportError(
+                "[W&B] --use_wandb was set but wandb is not installed in this environment."
+            )
+        if args.wandb_project is None:
+            raise ValueError("[W&B] --wandb_project is required when --use_wandb is set.")
+
+        run_name = args.wandb_run_name
+        if run_name is None:
+            # default: base model dir name with EVAL prefix
+            run_name = f"EVAL_{os.path.basename(os.path.normpath(args.model_dir))}"
+
+        print("[W&B] Initializing Weights & Biases eval run...")
+        run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            group=args.wandb_group,
+            config=full_config,
+        )
+    else:
+        print("[W&B] W&B logging disabled for evaluation.")
+
+    # -----------------------------------------------------------------
+    # Load TRAIN MuData and model
+    # -----------------------------------------------------------------
+    print("=" * 80)
+    print("[SETUP] EVAL-ONLY SPLICEVI")
+    print(f"[SETUP] TRAIN MuData path : {args.train_mdata_path}")
+    print(f"[SETUP] TEST  MuData path : {args.test_mdata_path}")
+    print(f"[SETUP] Model directory   : {args.model_dir}")
+    print(f"[SETUP] Figures directory : {args.fig_dir}")
+    print(f"[SETUP] EVAL blocks       : {sorted(EVALS)}")
+    print("=" * 80)
+
+    print(f"[DATA] Loading TRAIN MuData from {args.train_mdata_path} ...")
+    mdata_train = mu.read_h5mu(args.train_mdata_path, backed="r")
+    if args.mapping_csv is not None:
+        apply_obs_mapping_from_csv(mdata_train, args.mapping_csv)
+
+    # Fixed layer names
+    x_layer = "junc_ratio"
+    junction_counts_layer = "cell_by_junction_matrix"
+    cluster_counts_layer = "cell_by_cluster_matrix"
+    mask_layer = "psi_mask"
+
+    print("[DATA] TRAIN 'splicing' layers available:")
+    print(f"       {list(mdata_train['splicing'].layers.keys())}")
+
+    # Library size
+    if "X_library_size" in mdata_train["rna"].obsm_keys():
+        mdata_train["rna"].obs["X_library_size"] = mdata_train["rna"].obsm["X_library_size"]
+
+    print("[MODEL] Setting up SPLICEVI on TRAIN MuData ...")
+    SPLICEVI.setup_mudata(
+        mdata_train,
+        batch_key=None,
+        size_factor_key="X_library_size",
+        rna_layer="length_norm",
+        junc_ratio_layer=x_layer,
+        atse_counts_layer=cluster_counts_layer,
+        junc_counts_layer=junction_counts_layer,
+        psi_mask_layer=mask_layer,
+        modalities={"rna_layer": "rna", "junc_ratio_layer": "splicing"},
+    )
+
+    print(f"[MODEL] Loading SPLICEVI model from {args.model_dir} ...")
+    model = SPLICEVI.load(args.model_dir, adata=mdata_train)
+    model.view_anndata_setup()
+
+    if run is not None:
+        wandb.watch(
+            model.module,
+            log="all",
+            log_freq=args.wandb_log_freq,
+            log_graph=False,
+        )
+        total_params = sum(p.numel() for p in model.module.parameters())
+        print(f"[MODEL] Total model parameters: {total_params:,}")
+        wandb.log({"total_parameters": total_params})
+
+    # Basic shared keys
+    umap_color_key = "broad_cell_type"
+    cell_type_classification_key = (
+        "medium_cell_type"
+        if "medium_cell_type" in mdata_train.obs
+        else "broad_cell_type"
+    )
+
+    # -----------------------------------------------------------------
+    # UMAP evaluation (TRAIN)
+    # -----------------------------------------------------------------
+    latent_spaces_train = {
+        "joint": model.get_latent_representation(),
+        "expression": model.get_latent_representation(modality="expression"),
+        "splicing": model.get_latent_representation(modality="splicing"),
+    }
+
+    if "umap" in EVALS:
+        print("[EVAL/UMAP] Computing latent UMAPs on TRAIN...")
+
+        # top-N handling for both label columns
+        color_specs = {}
+        for col in [umap_color_key, cell_type_classification_key]:
+            plot_col, top_cts, palette = make_topn_categorical(
+                mdata_train["rna"], col, TOP_N_CT
+            )
+            color_specs[col] = dict(
+                plot_col=plot_col,
+                top_cts=top_cts,
+                palette=palette,
+            )
+
+        for name, Z in latent_spaces_train.items():
+            key_latent = f"X_latent_{name}"
+            key_nn = f"neighbors_{name}"
+            key_umap = f"X_umap_{name}"
+
+            print(f"[EVAL/UMAP] Neighbors/UMAP for latent space: {name}")
+            mdata_train["rna"].obsm[key_latent] = Z
+            sc.pp.neighbors(mdata_train["rna"], use_rep=key_latent, key_added=key_nn)
+            sc.tl.umap(mdata_train["rna"], min_dist=0.1, neighbors_key=key_nn)
+            mdata_train["rna"].obsm[key_umap] = mdata_train["rna"].obsm["X_umap"]
+
+            cols_to_plot = [umap_color_key]
+            if cell_type_classification_key != umap_color_key:
+                cols_to_plot.append(cell_type_classification_key)
+
+            for col in cols_to_plot:
+                c_spec = color_specs[col]
+                top_count = (
+                    len(c_spec["top_cts"]) if c_spec["top_cts"] is not None else "all"
+                )
+
+                plt.figure(figsize=(8, 5))
+                sc.pl.embedding(
+                    mdata_train["rna"],
+                    basis=key_umap,
+                    color=c_spec["plot_col"],
+                    palette=c_spec["palette"],
+                    show=False,
+                    frameon=True,
+                    legend_loc="right margin",
+                    legend_fontsize=10,
+                    title=None,
+                )
+
+                plt.title(f"TRAIN UMAP by {col} (Top {top_count} highlighted)")
+                plt.tight_layout(rect=[0, 0, 1, 0.95])
+
+                out_path = (
+                    f"{args.fig_dir}/train_umap_{col}_{name}_top{top_count}.png"
+                )
+                plt.savefig(out_path, dpi=300, bbox_inches="tight")
+                if run is not None:
+                    wandb.log({f"umap/{col}_{name}_train": wandb.Image(out_path)})
+                plt.close()
+
+        print("[EVAL/UMAP] All TRAIN UMAPs complete.")
+    else:
+        print("[EVAL/UMAP] UMAP evaluation skipped by config.")
+
+    # -----------------------------------------------------------------
+    # Clustering + consistency
+    # -----------------------------------------------------------------
+    LEIDEN_RESOLUTION = 1.0
+
+    if "clustering" in EVALS:
+        print("[EVAL/CLUSTER] Running Leiden clustering and consistency metrics...")
+
+        cell_type_col = "broad_cell_type"
+        if "medium_cell_type" in mdata_train["rna"].obs:
+            cell_type_col = "medium_cell_type"
+
+        def run_leiden_on_basis(ad, basis_key: str, neigh_key: str, leiden_key: str):
+            sc.pp.neighbors(ad, use_rep=basis_key, key_added=neigh_key)
+            sc.tl.leiden(
+                ad,
+                neighbors_key=neigh_key,
+                key_added=leiden_key,
+                resolution=LEIDEN_RESOLUTION,
+            )
+
+        excl_multi_records = []
+        spaces_order = ["expression", "splicing", "joint"]
+        leiden_keys = {}
+
+        for name in ["joint", "expression", "splicing"]:
+            basis_key = f"X_latent_{name}"
+            neigh_key = f"neighbors_{name}_leiden"
+            leiden_key = f"leiden_{name}"
+            run_leiden_on_basis(mdata_train["rna"], basis_key, neigh_key, leiden_key)
+            leiden_keys[name] = leiden_key
+
+            n_cl = int(mdata_train["rna"].obs[leiden_key].nunique())
+            if run is not None:
+                wandb.log({f"clustering/{name}_leiden_n_clusters": n_cl})
+
+            cts_per_cluster = (
+                mdata_train["rna"]
+                .obs.groupby(leiden_key)[cell_type_col]
+                .apply(lambda s: set(s.astype(str).values))
+            )
+            n_unique = sum(1 for s in cts_per_cluster.values if len(s) == 1)
+            n_multi = sum(1 for s in cts_per_cluster.values if len(s) > 1)
+
+            if run is not None:
+                wandb.log(
+                    {
+                        f"clusters/{name}_n_unique_one_celltype": int(n_unique),
+                        f"clusters/{name}_n_multi_celltypes": int(n_multi),
+                    }
+                )
+
+            excl_multi_records.append(
+                {
+                    "space": name,
+                    "category": "Unique to one cell type",
+                    "count": int(n_unique),
+                }
+            )
+            excl_multi_records.append(
+                {
+                    "space": name,
+                    "category": "Multiple cell types",
+                    "count": int(n_multi),
+                }
+            )
+
+            plt.figure(figsize=(6, 6))
+            sc.pl.embedding(
+                mdata_train["rna"],
+                basis="X_umap_joint",
+                color=leiden_key,
+                legend_loc=None,
+                frameon=True,
+                show=False,
+            )
+            plt.title(f"TRAIN joint UMAP colored by Leiden ({name})")
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
+            out_path = (
+                f"{args.fig_dir}/train_umap_joint_colored_by_{name}_leiden.png"
+            )
+            plt.savefig(out_path, dpi=300, bbox_inches="tight")
+            if run is not None:
+                wandb.log(
+                    {
+                        f"clustering/train_umap_joint_colored_by_{name}_leiden": wandb.Image(
+                            out_path
+                        )
+                    }
+                )
+            plt.close()
+
+        # Bar plot: subclusters per cell type
+        cell_type_for_bars = cell_type_col
+        obs = mdata_train["rna"].obs
+        ct_counts = obs[cell_type_for_bars].value_counts()
+        top20_cts = ct_counts.head(20).index.tolist()
+
+        records_sub = []
+        for space_name, leiden_key in leiden_keys.items():
+            sub_df = (
+                obs.loc[obs[cell_type_for_bars].isin(top20_cts), [cell_type_for_bars, leiden_key]]
+                .groupby(cell_type_for_bars)[leiden_key]
+                .nunique()
+                .rename("n_subclusters")
+                .reset_index()
+            )
+            sub_df["space"] = space_name
+            records_sub.append(sub_df)
+
+        sub_all = pd.concat(records_sub, ignore_index=True)
+        sub_all["space"] = pd.Categorical(
+            sub_all["space"], categories=spaces_order, ordered=True
+        )
+        sub_all[cell_type_for_bars] = pd.Categorical(
+            sub_all[cell_type_for_bars], categories=top20_cts, ordered=True
+        )
+
+        plt.figure(figsize=(max(12, 0.6 * len(top20_cts)), 6))
+        sns.barplot(
+            data=sub_all.sort_values([cell_type_for_bars, "space"]),
+            x=cell_type_for_bars,
+            y="n_subclusters",
+            hue="space",
+        )
+        plt.xticks(rotation=45, ha="right")
+        plt.xlabel(cell_type_for_bars)
+        plt.ylabel("Number of Leiden sub-clusters")
+        plt.title(
+            f"TRAIN sub-clusters per cell type (top 20, res={LEIDEN_RESOLUTION})"
+        )
+        plt.tight_layout()
+        out_path = f"{args.fig_dir}/train_bar_subclusters_top20_{cell_type_for_bars}_leiden_res_{LEIDEN_RESOLUTION}.png"
+        plt.savefig(out_path, dpi=300, bbox_inches="tight")
+        if run is not None:
+            wandb.log({"clustering/train_bar_subclusters_top20": wandb.Image(out_path)})
+        plt.close()
+
+        # Cluster exclusivity plot
+        ex_df = pd.DataFrame(excl_multi_records)
+        ex_df["space"] = pd.Categorical(
+            ex_df["space"], categories=spaces_order, ordered=True
+        )
+        ex_df["category"] = pd.Categorical(
+            ex_df["category"],
+            categories=["Unique to one cell type", "Multiple cell types"],
+            ordered=True,
+        )
+
+        plt.figure(figsize=(8, 5))
+        sns.barplot(data=ex_df, x="category", y="count", hue="space")
+        plt.xlabel("")
+        plt.ylabel("Number of Leiden clusters")
+        plt.title("TRAIN cluster exclusivity across spaces")
+        plt.tight_layout()
+        out_path = (
+            f"{args.fig_dir}/train_clusters_exclusive_vs_multi_by_space.png"
+        )
+        plt.savefig(out_path, dpi=300, bbox_inches="tight")
+        if run is not None:
+            wandb.log(
+                {
+                    "clustering/train_clusters_exclusive_vs_multi_by_space": wandb.Image(
+                        out_path
+                    )
+                }
+            )
+        plt.close()
+
+        # Pairwise same-cluster consistency
+        pairs = [("expression", "joint"), ("splicing", "joint"), ("expression", "splicing")]
+
+        n_cells = mdata_train["rna"].n_obs
+        idx_all = np.arange(n_cells, dtype=np.int32)
+
+        cluster_members = {}
+        for name in ["joint", "expression", "splicing"]:
+            labs = mdata_train["rna"].obs[leiden_keys[name]].values
+            members = {}
+            for cid, grp in pd.Series(idx_all).groupby(labs):
+                members[cid] = grp.values.astype(np.int32, copy=False)
+            cluster_members[name] = (labs, members)
+
+        heat_records = []
+        for a, b in pairs:
+            labs_a, mem_a = cluster_members[a]
+            labs_b, mem_b = cluster_members[b]
+
+            overlap = np.empty(n_cells, dtype=np.float32)
+            for i in range(n_cells):
+                ca = labs_a[i]
+                cb = labs_b[i]
+                Sa = mem_a[ca]
+                Sb = mem_b[cb]
+                if Sa.size <= 1:
+                    overlap[i] = np.nan
+                    continue
+                Sa_no_i = Sa[Sa != i]
+                inter_sz = len(set(Sa_no_i).intersection(Sb))
+                overlap[i] = inter_sz / float(Sa_no_i.size)
+
+            key_cell = f"samecluster_overlap_{a}_vs_{b}"
+            mdata_train["rna"].obs[key_cell] = overlap
+
+            mean_ov = float(np.nanmean(overlap))
+            median_ov = float(np.nanmedian(overlap))
+            if run is not None:
+                wandb.log(
+                    {
+                        f"clustering/{a}_vs_{b}_samecluster_mean": mean_ov,
+                        f"clustering/{a}_vs_{b}_samecluster_median": median_ov,
+                    }
+                )
+
+            if "tissue" in mdata_train["rna"].obs:
+                pair_label = (
+                    mdata_train["rna"]
+                    .obs["tissue"]
+                    .astype("string")
+                    .fillna("NA")
+                    .str.cat(
+                        mdata_train["rna"]
+                        .obs[cell_type_col]
+                        .astype("string")
+                        .fillna("NA"),
+                        sep=" | ",
+                    )
+                    .to_numpy()
+                )
+            else:
+                pair_label = (
+                    mdata_train["rna"]
+                    .obs[cell_type_col]
+                    .astype("string")
+                    .fillna("NA")
+                    .to_numpy()
+                )
+
+            df_tmp = (
+                pd.DataFrame({"pair_label": pair_label, "overlap": overlap})
+                .groupby("pair_label", as_index=False)["overlap"]
+                .mean()
+            )
+            df_tmp["pct_consistent"] = df_tmp["overlap"].fillna(0.0) * 100.0
+            df_tmp["pair"] = f"{a}_vs_{b}"
+            heat_records.append(
+                df_tmp[["pair_label", "pair", "pct_consistent"]]
+            )
+
+        heat_df = pd.concat(heat_records, ignore_index=True)
+        heat_pivot = heat_df.pivot(
+            index="pair_label", columns="pair", values="pct_consistent"
+        ).fillna(0.0)
+
+        plt.close("all")
+        g = sns.clustermap(
+            heat_pivot,
+            cmap="viridis",
+            vmin=0.0,
+            vmax=100.0,
+            metric="euclidean",
+            method="average",
+            figsize=(
+                max(6, 0.25 * heat_pivot.shape[1] + 4),
+                max(6, 0.30 * heat_pivot.shape[0] + 3),
+            ),
+            row_cluster=True,
+            col_cluster=False,
+            annot=False,
+        )
+        g.figure.suptitle(
+            f"TRAIN percent consistent by tissue | cell type (Leiden, res={LEIDEN_RESOLUTION})",
+            y=1.02,
+            fontsize=12,
+        )
+        out_path = f"{args.fig_dir}/train_clustermap_pct_consistent_leiden_res_{LEIDEN_RESOLUTION}.png"
+        g.figure.savefig(out_path, dpi=300, bbox_inches="tight")
+        if run is not None:
+            wandb.log(
+                {"clustering/train_clustermap_pct_consistent": wandb.Image(out_path)}
+            )
+        plt.close(g.figure)
+
+        # AMI
+        for a, b in pairs:
+            ami = adjusted_mutual_info_score(
+                mdata_train["rna"].obs[leiden_keys[a]].values,
+                mdata_train["rna"].obs[leiden_keys[b]].values,
+            )
+            if run is not None:
+                wandb.log({f"clustering/{a}_vs_{b}_AMI": float(ami)})
+
+        del heat_records, heat_pivot, heat_df
+        gc.collect()
+    else:
+        print("[EVAL/CLUSTER] Clustering evaluation skipped by config.")
+
+    # -----------------------------------------------------------------
+    # Train / Test latent evaluation
+    # -----------------------------------------------------------------
+    if "train_eval" in EVALS:
+        evaluate_split(
+            "train",
+            mdata_train,
+            model,
+            umap_color_key,
+            cell_type_classification_key,
+            Z_type="joint",
+            wandb=wandb if run is not None else None,
+        )
+        evaluate_split(
+            "train",
+            mdata_train,
+            model,
+            umap_color_key,
+            cell_type_classification_key,
+            Z_type="expression",
+            wandb=wandb if run is not None else None,
+        )
+        evaluate_split(
+            "train",
+            mdata_train,
+            model,
+            umap_color_key,
+            cell_type_classification_key,
+            Z_type="splicing",
+            wandb=wandb if run is not None else None,
+        )
+    else:
+        print("[EVAL/TRAIN] Train-split evaluation skipped by config.")
+
+    # Free TRAIN data
+    print("[CLEANUP] Releasing TRAIN MuData from memory...")
+    del mdata_train
+    torch.cuda.empty_cache()
+
+    # -----------------------------------------------------------------
+    # TEST evaluation
+    # -----------------------------------------------------------------
+    print(f"[DATA] Loading TEST MuData from {args.test_mdata_path} ...")
+    mdata_test = mu.read_h5mu(args.test_mdata_path, backed="r")
+    if args.mapping_csv is not None:
+        apply_obs_mapping_from_csv(mdata_test, args.mapping_csv)
+
+    if "X_library_size" in mdata_test["rna"].obsm_keys():
+        mdata_test["rna"].obs["X_library_size"] = mdata_test["rna"].obsm["X_library_size"]
+
+    print("[MODEL] Setting up SPLICEVI on TEST MuData ...")
+    SPLICEVI.setup_mudata(
+        mdata_test,
+        batch_key=None,
+        size_factor_key="X_library_size",
+        rna_layer="length_norm",
+        junc_ratio_layer=x_layer,
+        atse_counts_layer=cluster_counts_layer,
+        junc_counts_layer=junction_counts_layer,
+        psi_mask_layer=mask_layer,
+        modalities={"rna_layer": "rna", "junc_ratio_layer": "splicing"},
+    )
+
+    if "test_eval" in EVALS:
+        evaluate_split(
+            "test",
+            mdata_test,
+            model,
+            umap_color_key,
+            cell_type_classification_key,
+            Z_type="joint",
+            wandb=wandb if run is not None else None,
+        )
+        evaluate_split(
+            "test",
+            mdata_test,
+            model,
+            umap_color_key,
+            cell_type_classification_key,
+            Z_type="expression",
+            wandb=wandb if run is not None else None,
+        )
+        evaluate_split(
+            "test",
+            mdata_test,
+            model,
+            umap_color_key,
+            cell_type_classification_key,
+            Z_type="splicing",
+            wandb=wandb if run is not None else None,
+        )
+    else:
+        print("[EVAL/TEST] Test-split evaluation skipped by config.")
+
+    # Age R² CSV dump
+    if "age_r2_heatmap" in EVALS:
+        if len(AGE_R2_RECORDS) > 0:
+            age_df = pd.DataFrame(AGE_R2_RECORDS)
+            csv_path = f"{args.fig_dir}/age_r2_by_tissue_celltype_train_test.csv"
+            age_df.to_csv(csv_path, index=False)
+            if run is not None:
+                wandb.log({"age_r2/records_csv_path": csv_path})
+            print(
+                f"[EVAL/AGE] Wrote age R² records to {csv_path} "
+                f"({age_df.shape[0]} rows)."
+            )
+        else:
+            print("[EVAL/AGE] No age R² pairing records collected; skipping CSV.")
+    else:
+        print("[EVAL/AGE] Age R² CSV skipped by config.")
+
+    # -----------------------------------------------------------------
+    # Masked-ATSE imputation on TEST
+    # -----------------------------------------------------------------
+    print("[CLEANUP] Releasing TEST MuData from memory before masked imputation...")
+    del mdata_test
+    torch.cuda.empty_cache()
+
+    if "masked_impute" in EVALS:
+        if not args.masked_test_mdata_paths:
+            print("[EVAL/IMPUTE] No masked_test_mdata_paths provided. Skipping.")
+        else:
+            for masked_path in args.masked_test_mdata_paths:
+                fname = os.path.basename(masked_path)
+                m = re.search(
+                    r"(\d+)\s*%|MASKED[_-]?(\d+)", fname, flags=re.IGNORECASE
+                )
+                if m:
+                    pct = m.group(1) or m.group(2)
+                    tag = f"{pct}pct"
+                else:
+                    tag = re.sub(
+                        r"[^A-Za-z0-9]+", "_", os.path.splitext(fname)[0]
+                    )[:40]
+
+                print(
+                    f"\n[EVAL/IMPUTE] Masked-ATSE imputation on TEST using {masked_path} ({tag})"
+                )
+                mdata_masked = mu.read_h5mu(masked_path, backed="r")
+                if args.mapping_csv is not None:
+                    apply_obs_mapping_from_csv(mdata_masked, args.mapping_csv)
+
+                ad_masked = mdata_masked["splicing"]
+
+                if "X_library_size" in mdata_masked["rna"].obsm_keys():
+                    mdata_masked["rna"].obs["X_library_size"] = mdata_masked["rna"].obsm[
+                        "X_library_size"
+                    ]
+
+                print("[EVAL/IMPUTE] Setting up SPLICEVI on masked MuData...")
+                SPLICEVI.setup_mudata(
+                    mdata_masked,
+                    batch_key=None,
+                    size_factor_key="X_library_size",
+                    rna_layer="length_norm",
+                    junc_ratio_layer=x_layer,
+                    atse_counts_layer=cluster_counts_layer,
+                    junc_counts_layer=junction_counts_layer,
+                    psi_mask_layer=mask_layer,
+                    modalities={"rna_layer": "rna", "junc_ratio_layer": "splicing"},
+                )
+
+                print("[EVAL/IMPUTE] Running PSI imputation and computing metrics...")
+                model.module.eval()
+
+                masked_orig = ad_masked.layers["junc_ratio_masked_original"]
+                if not sparse.isspmatrix_csr(masked_orig):
+                    masked_orig = sparse.csr_matrix(masked_orig)
+
+                bin_mask = ad_masked.layers["junc_ratio_masked_bin_mask"]
+                if not sparse.isspmatrix_csr(bin_mask):
+                    bin_mask = sparse.csr_matrix(bin_mask)
+
+                n_cells = bin_mask.shape[0]
+                # New behavior: if impute_batch_size == -1, do one big batch
+                if args.impute_batch_size == -1:
+                    bs = n_cells if n_cells > 0 else 1
+                    print(
+                        f"[EVAL/IMPUTE] impute_batch_size = -1, processing all {n_cells} cells in one batch."
+                    )
+                else:
+                    bs = args.impute_batch_size
+                    print(
+                        f"[EVAL/IMPUTE] Using mini-batch size {bs} for masked imputation."
+                    )
+
+                orig_all, pred_all = [], []
+                pairs_total = 0
+
+                for start in range(0, n_cells, bs):
+                    stop = min(start + bs, n_cells)
+                    submask = bin_mask[start:stop]
+                    sub_r, sub_c = submask.nonzero()
+                    if sub_r.size == 0:
+                        continue
+
+                    idx = np.arange(start, stop, dtype=np.int64)
+                    with torch.inference_mode():
+                        decoded_batch = model.get_normalized_splicing(
+                            adata=mdata_masked,
+                            indices=idx,
+                            return_numpy=True,
+                            batch_size=bs,
+                        )
+
+                    orig_vals_b = masked_orig[start:stop][:, sub_c][
+                        sub_r, np.arange(sub_r.size)
+                    ].A1
+                    pred_vals_b = decoded_batch[sub_r, sub_c]
+
+                    orig_all.append(orig_vals_b.astype(np.float32, copy=False))
+                    pred_all.append(pred_vals_b.astype(np.float32, copy=False))
+                    pairs_total += orig_vals_b.size
+
+                    del decoded_batch
+                    torch.cuda.empty_cache()
+
+                if pairs_total == 0:
+                    print(
+                        f"[EVAL/IMPUTE/{tag}] No masked entries found; skipping correlation."
+                    )
+                else:
+                    orig_all = np.concatenate(orig_all, dtype=np.float32)
+                    pred_all = np.concatenate(pred_all, dtype=np.float32)
+
+                    pearson_m = float(np.corrcoef(orig_all, pred_all)[0, 1])
+                    spearman_m = float(
+                        spearmanr(orig_all, pred_all, nan_policy="omit")[0]
+                    )
+
+                    abs_diff = np.abs(orig_all - pred_all)
+                    l1_mean = float(np.mean(abs_diff))
+                    l1_median = float(np.median(abs_diff))
+                    l1_p90 = float(np.quantile(abs_diff, 0.90))
+
+                    print(
+                        f"[EVAL/IMPUTE/{tag}] PSI corr — "
+                        f"Pearson: {pearson_m:.4f}, Spearman: {spearman_m:.4f}  (n={pairs_total})"
+                    )
+                    print(
+                        f"[EVAL/IMPUTE/{tag}] PSI L1 — "
+                        f"mean: {l1_mean:.4e}, median: {l1_median:.4e}, p90: {l1_p90:.4e}"
+                    )
+
+                    if run is not None:
+                        wandb.log(
+                            {
+                                f"impute-test/{tag}/psi_pearson_corr_masked_atse": pearson_m,
+                                f"impute-test/{tag}/psi_spearman_corr_masked_atse": spearman_m,
+                                f"impute-test/{tag}/psi_l1_mean_masked_atse": l1_mean,
+                                f"impute-test/{tag}/psi_l1_median_masked_atse": l1_median,
+                                f"impute-test/{tag}/psi_l1_p90_masked_atse": l1_p90,
+                                f"impute-test/{tag}/n_masked_entries": int(pairs_total),
+                                f"impute-test/{tag}/impute_batch_size": bs,
+                                f"impute-test/{tag}/masked_file": masked_path,
+                            }
+                        )
+
+                del (
+                    mdata_masked,
+                    ad_masked,
+                    masked_orig,
+                    bin_mask,
+                    orig_all,
+                    pred_all,
+                )
+                gc.collect()
+                torch.cuda.empty_cache()
+    else:
+        print("[EVAL/IMPUTE] Masked imputation eval skipped by config.")
+
+    # -----------------------------------------------------------------
+    # Finish
+    # -----------------------------------------------------------------
+    print("[CLEANUP] Releasing SPLICEVI model and GPU memory...")
+    del model
+    torch.cuda.empty_cache()
+
+    if run is not None:
+        print("[W&B] Finishing W&B eval run.")
+        run.finish()
+
+    print("[DONE] Evaluation pipeline complete.")
+
+
+if __name__ == "__main__":
+    main()
