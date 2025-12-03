@@ -41,11 +41,11 @@ CONDA_BASE="/gpfs/commons/home/svaidyanathan/miniconda3"
 ENV_NAME="splicevi-env"
 
 # 3) Core hyperparameters
-MAX_EPOCHS=1          # Total training epochs
+MAX_EPOCHS=500          # Total training epochs
 LR=1e-5                 # Learning rate
 BATCH_SIZE=256          # Minibatch size
 N_EPOCHS_KL_WARMUP=100  # KL warmup epochs
-N_LATENT=25             # Latent dimensionality
+N_LATENT=10             # Latent dimensionality
 DROPOUT_RATE=0.01       # Model dropout rate
 SPLICING_LOSS_TYPE="dirichlet_multinomial"  # binomial | beta_binomial | dirichlet_multinomial
 

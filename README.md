@@ -11,7 +11,9 @@ conda activate splicevi-env
 pip install -r requirements.txt
 
 chmod +x train_splicevi.sh
+
 chmod +x eval_splicevi.sh
 
-train_splicevi.sh
-eval_splicevi.sh
+sbatch train_splicevi.sh
+
+sbatch eval_splicevi.sh
