@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=splicevi_eval_batch
-#SBATCH --output=/logs/splicevi_train_%j.out
-#SBATCH --error=/logs/splicevi_train_%j.err
+#SBATCH --job-name=splicevi_eval_basic
+#SBATCH --output=logs/splicevi_eval_%j.out
+#SBATCH --error=logs/splicevi_eval_%j.err
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --mem=230G
@@ -9,19 +9,14 @@
 
 set -euo pipefail
 
-
 # eval_splicevi.sh
 #
-# Eval-only Slurm driver for SPLICEVI.
+# Minimal Slurm job script to:
+#   1. Load TRAIN and TEST MuData
+#   2. Load a trained SPLICEVI model from MODEL_DIR
+#   3. Run selected evaluation blocks (UMAP, clustering, metrics, imputation)
+#   4. Save evaluation figures/CSVs under a per-run directory
 #
-# For each trained model directory, this script:
-#   1. Loads the TRAIN and TEST MuData
-#   2. Loads the trained SPLICEVI model from disk
-#   3. Runs the requested evaluation blocks (UMAP, clustering, metrics, imputation)
-#   4. Saves evaluation figures/CSVs under a per-run directory
-#
-# This script is designed to be independent of the training script.
-
 # Submit with:
 #   sbatch eval_splicevi.sh
 
@@ -42,14 +37,11 @@ MASKED_TEST_MDATA_PATHS="\
 /gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/MASKED_50_PERCENT_test_30_70_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu \
 /gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/MASKED_75_PERCENT_test_30_70_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu"
 
-# 2) Model directories to evaluate (ONE JOB PER MODEL_DIR)
-MODEL_DIRS=(
-  "/gpfs/commons/home/svaidyanathan/splice_vi_partial_vae_sweep/batch_20251112_131914/mouse_trainandtest_REAL_cd=32_mn=50000_ld=25_lr=1e-5_0_scatter_PartialEncoderEDDI_pool=mean/models"
-  "/gpfs/commons/home/svaidyanathan/splice_vi_partial_vae_sweep/batch_20251112_131914/mouse_trainandtest_REAL_cd=32_mn=50000_ld=25_lr=1e-5_2_scatter_PartialEncoderEDDI_pool=mean/models"
-  "/gpfs/commons/home/svaidyanathan/splice_vi_partial_vae_sweep/batch_20251111_114606/mouse_trainandtest_REAL_cd=32_mn=50000_ld=25_lr=1e-5_0_scatter_PartialEncoderEDDI_pool=mean/models"
-)
+# 2) Single model directory to evaluate
+MODEL_DIR="/gpfs/commons/home/svaidyanathan/repos/SpliceVI/models/splicevi_basic_20251201_212338/"
 
 # 3) Evaluation blocks to run
+# These must match argparse in eval_splicevi.py (nargs="+")
 EVALS=(
   umap
   # clustering
@@ -74,44 +66,54 @@ UMAP_OBS_KEYS=(
 # 5) Conda / script locations
 CONDA_BASE="/gpfs/commons/home/svaidyanathan/miniconda3"
 ENV_NAME="splicevi-env"
-SCRIPT_PATH="/gpfs/commons/home/svaidyanathan/repos/multivi_tools_splicing/multivi_splice_utils/runfiles/eval_splicevi_basic.py"
+SCRIPT_PATH="src/eval_splicevi.py"   # relative to repo root
 
 # 6) W&B configuration (optional)
 USE_WANDB=true                        # set to "false" to disable W&B logging
 WANDB_PROJECT="MLCB_SUBMISSION"       # required if USE_WANDB=true
 WANDB_ENTITY=""                       # optional W&B entity (team)
 WANDB_GROUP="splicevi_eval"           # optional W&B group name
-WANDB_RUN_NAME_PREFIX="basic_eval"    # prefix for per-model run names
+WANDB_RUN_NAME_PREFIX="basic_eval"    # prefix for run names
 WANDB_LOG_FREQ=1000                   # how often to log from wandb.watch
 
-# 7) Output directory for eval runs
-BASE_RUN_DIR="/gpfs/commons/home/svaidyanathan/splice_vi_partial_vae_eval"
+# 7) Output directory for eval run
+BASE_RUN_DIR="/gpfs/commons/home/svaidyanathan/repos/SpliceVI/logs"
+
+#######################################
+# DERIVED SETTINGS
+#######################################
+
 TS=$(date +"%Y%m%d_%H%M%S")
-BATCH_RUN_DIR="${BASE_RUN_DIR}/batch_${TS}"
-mkdir -p "${BATCH_RUN_DIR}"
+MODEL_BASENAME=$(basename "${MODEL_DIR}")
+RUN_NAME="eval_${MODEL_BASENAME}_${TS}"
+
+RUN_DIR="${BASE_RUN_DIR}/${RUN_NAME}"
+FIG_DIR="${RUN_DIR}/figures"
+mkdir -p "${FIG_DIR}"
 
 echo "=================================================================="
-echo "[BATCH] SPLICEVI basic eval batch"
-echo "[BATCH] TRAIN_MDATA_PATH = ${TRAIN_MDATA_PATH}"
-echo "[BATCH] TEST_MDATA_PATH  = ${TEST_MDATA_PATH}"
-echo "[BATCH] MAPPING_CSV      = ${MAPPING_CSV}"
-echo "[BATCH] MASKED_TEST_MDATA_PATHS:"
+echo "[JOB] SPLICEVI basic eval job"
+echo "[JOB] Slurm job ID           : ${SLURM_JOB_ID:-N/A}"
+echo "[JOB] Run name               : ${RUN_NAME}"
+echo "[JOB] MODEL_DIR              : ${MODEL_DIR}"
+echo "[JOB] TRAIN_MDATA_PATH       : ${TRAIN_MDATA_PATH}"
+echo "[JOB] TEST_MDATA_PATH        : ${TEST_MDATA_PATH}"
+echo "[JOB] Mapping CSV            : ${MAPPING_CSV}"
+echo "[JOB] Eval output directory  : ${RUN_DIR}"
+echo "[JOB] Figures directory      : ${FIG_DIR}"
+echo "=================================================================="
+echo "[JOB] MASKED_TEST_MDATA_PATHS:"
 for p in ${MASKED_TEST_MDATA_PATHS}; do
   echo "         - ${p}"
 done
-echo "[BATCH] MODEL_DIRS:"
-for m in "${MODEL_DIRS[@]}"; do
-  echo "         - ${m}"
-done
-echo "[BATCH] UMAP_OBS_KEYS:"
+echo "[JOB] UMAP_OBS_KEYS:"
 for k in "${UMAP_OBS_KEYS[@]}"; do
   echo "         - ${k}"
 done
-echo "[BATCH] Output batch dir = ${BATCH_RUN_DIR}"
 echo "=================================================================="
 
 #######################################
-# ENVIRONMENT SETUP (once)
+# ENVIRONMENT SETUP
 #######################################
 
 echo "[ENV] Activating conda environment '${ENV_NAME}'..."
@@ -122,92 +124,46 @@ echo "[ENV] Python version  : $(python -V)"
 echo
 
 #######################################
-# BUILD W&B ARG STRING (shared)
+# BUILD OPTIONAL W&B ARGUMENT STRING
 #######################################
 
 WANDB_ARGS=""
 if [ "${USE_WANDB}" = true ]; then
-  echo "[W&B] W&B logging enabled for all eval jobs."
-  if [ -z "${WANDB_PROJECT}" ]; then
+  echo "[W&B] Enabling Weights & Biases logging."
+  WANDB_ARGS+=" --use_wandb"
+  if [ -n "${WANDB_PROJECT}" ]; then
+    WANDB_ARGS+=" --wandb_project ${WANDB_PROJECT}"
+  else
     echo "[W&B] ERROR: USE_WANDB=true but WANDB_PROJECT is empty."
     exit 1
   fi
+  if [ -n "${WANDB_ENTITY}" ]; then
+    WANDB_ARGS+=" --wandb_entity ${WANDB_ENTITY}"
+  fi
+  if [ -n "${WANDB_GROUP}" ]; then
+    WANDB_ARGS+=" --wandb_group ${WANDB_GROUP}"
+  fi
+  WANDB_RUN_NAME="${WANDB_RUN_NAME_PREFIX}_${MODEL_BASENAME}"
+  WANDB_ARGS+=" --wandb_run_name ${WANDB_RUN_NAME}"
+  WANDB_ARGS+=" --wandb_log_freq ${WANDB_LOG_FREQ}"
 else
-  echo "[W&B] W&B logging disabled."
+  echo "[W&B] W&B logging disabled for this run."
 fi
 echo
 
 #######################################
-# SUBMIT ONE JOB PER MODEL_DIR
+# PREPARE MULTI-VALUE ARGUMENTS
 #######################################
 
 EVALS_JOINED="${EVALS[*]}"
 UMAP_OBS_KEYS_JOINED="${UMAP_OBS_KEYS[*]}"
 
-job_index=0
-for MODEL_DIR in "${MODEL_DIRS[@]}"; do
-  ((job_index++))
+#######################################
+# LAUNCH EVALUATION
+#######################################
 
-  MODEL_BASENAME=$(basename "${MODEL_DIR}")
-  RUN_NAME="eval_${MODEL_BASENAME}_${TS}"
-
-  # Per-model directories
-  RUN_SUBDIR="${BATCH_RUN_DIR}/run_$(printf '%02d' "${job_index}")"
-  mkdir -p "${RUN_SUBDIR}"
-
-  JOB_NAME="eval_${MODEL_BASENAME}"
-  JOB_DIR="${RUN_SUBDIR}/${JOB_NAME}"
-  mkdir -p "${JOB_DIR}/figures"
-  FIG_DIR="${JOB_DIR}/figures"
-
-  echo "------------------------------------------------------------------"
-  echo "[JOB ${job_index}] Submitting eval for model: ${MODEL_DIR}"
-  echo "[JOB ${job_index}] JOB_NAME      = ${JOB_NAME}"
-  echo "[JOB ${job_index}] JOB_DIR       = ${JOB_DIR}"
-  echo "[JOB ${job_index}] FIG_DIR       = ${FIG_DIR}"
-  echo "------------------------------------------------------------------"
-
-  # Build per-job W&B args (run name can be unique per model)
-  PER_JOB_WANDB_ARGS=""
-  if [ "${USE_WANDB}" = true ]; then
-    PER_JOB_WANDB_ARGS+=" --use_wandb"
-    PER_JOB_WANDB_ARGS+=" --wandb_project ${WANDB_PROJECT}"
-    if [ -n "${WANDB_ENTITY}" ]; then
-      PER_JOB_WANDB_ARGS+=" --wandb_entity ${WANDB_ENTITY}"
-    fi
-    if [ -n "${WANDB_GROUP}" ]; then
-      PER_JOB_WANDB_ARGS+=" --wandb_group ${WANDB_GROUP}"
-    fi
-    WANDB_RUN_NAME="${WANDB_RUN_NAME_PREFIX}_${MODEL_BASENAME}"
-    PER_JOB_WANDB_ARGS+=" --wandb_run_name ${WANDB_RUN_NAME}"
-    PER_JOB_WANDB_ARGS+=" --wandb_log_freq ${WANDB_LOG_FREQ}"
-  fi
-
-  # Launch the eval as a child Slurm job
-  sbatch \
-    --job-name="${JOB_NAME}" \
-    --output="${JOB_DIR}/slurm_%j.out" \
-    --error="${JOB_DIR}/slurm_%j.err" \
-    --partition=gpu \
-    --gres=gpu:1 \
-    --mem=230G \
-    --time=30:00:00 \
-    --wrap "$(cat <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-
-echo "[EVAL] Starting eval for model: ${MODEL_DIR}"
-echo "[EVAL] TRAIN_MDATA_PATH = ${TRAIN_MDATA_PATH}"
-echo "[EVAL] TEST_MDATA_PATH  = ${TEST_MDATA_PATH}"
-echo "[EVAL] FIG_DIR          = ${FIG_DIR}"
-echo "[EVAL] MAPPING_CSV      = ${MAPPING_CSV}"
-echo "[EVAL] EVALS            = ${EVALS_JOINED}"
-echo "[EVAL] UMAP_OBS_KEYS    = ${UMAP_OBS_KEYS_JOINED}"
-echo "[EVAL] IMPUTE_BATCH_SIZE= ${IMPUTE_BATCH_SIZE}"
-echo "[EVAL] UMAP_TOP_N_CT    = ${UMAP_TOP_N_CELLTYPES}"
-
-source "${CONDA_BASE}/etc/profile.d/conda.sh"
-conda activate "${ENV_NAME}"
+echo "[RUN] Launching SPLICEVI eval script..."
+set -x
 
 python "${SCRIPT_PATH}" \
   --train_mdata_path "${TRAIN_MDATA_PATH}" \
@@ -215,20 +171,15 @@ python "${SCRIPT_PATH}" \
   --model_dir "${MODEL_DIR}" \
   --fig_dir "${FIG_DIR}" \
   --mapping_csv "${MAPPING_CSV}" \
-  --impute_batch_size ${IMPUTE_BATCH_SIZE} \
-  --umap_top_n_celltypes ${UMAP_TOP_N_CELLTYPES} \
+  --impute_batch_size "${IMPUTE_BATCH_SIZE}" \
+  --umap_top_n_celltypes "${UMAP_TOP_N_CELLTYPES}" \
   --umap_obs_keys ${UMAP_OBS_KEYS_JOINED} \
   --evals ${EVALS_JOINED} \
   ${MASKED_TEST_MDATA_PATHS:+--masked_test_mdata_paths ${MASKED_TEST_MDATA_PATHS}} \
-  ${PER_JOB_WANDB_ARGS}
-EOF
-)"
+  ${WANDB_ARGS}
 
-done
+set +x
 
 echo
-echo "=================================================================="
-echo "[BATCH] All eval jobs submitted."
-echo "[BATCH] Monitor with: squeue -u \$(whoami)"
-echo "[BATCH] Batch outputs in: ${BATCH_RUN_DIR}"
-echo "=================================================================="
+echo "[DONE] SPLICEVI basic eval job finished."
+echo "[DONE] Eval outputs in: ${RUN_DIR}"

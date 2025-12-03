@@ -254,9 +254,6 @@ class MyAdvTrainingPlan(AdversarialTrainingPlan):
                 torch.nn.utils.clip_grad_norm_(self.module.parameters(),  max_norm=self.gradient_clipping_max_norm)
             opt2.step()
 
-
-
-
 class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin):
     """Integration of gene expression and alternative splicing signals.
 
@@ -291,7 +288,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
     splicing_architecture
         Splicing branch type:
         * ``"vanilla"`` – SCVI `Encoder` + `DecoderSplice`,
-        * ``"partial"`` – PartialEncoder family + `LinearDecoder`.
+        * ``"partial"`` – `PartialEncoderEDDIFaster` + `LinearDecoder`.
     expression_architecture
         Expression decoder: ``"vanilla"`` (nonlinear) or ``"linear"`` (linear decoder).
 
@@ -301,9 +298,9 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
     n_latent
         Joint latent dimensionality (per-modality before concatenation). If `None`, uses √(n_hidden).
     n_layers_encoder
-        Hidden layers in encoders.
+        Hidden layers in encoders (including the post pooling MLP in the partial splicing encoder).
     n_layers_decoder
-        Hidden layers in decoders (not used by the linear decoder).
+        Hidden layers in decoders (not used by the linear decoders).
     dropout_rate
         Dropout rate in MLPs.
     use_batch_norm
@@ -321,36 +318,22 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
     splicing_loss_type
         Splicing reconstruction loss: ``"binomial"``, ``"beta_binomial"``, or ``"dirichlet_multinomial"``.
     splicing_concentration
-        Optional concentration for beta-binomial; ignored for binomial.
+        Optional concentration for beta binomial. Ignored for binomial.
     dm_concentration
-        For Dirichlet-multinomial: ``"atse"`` (per-ATSE concentration) or ``"scalar"`` (single shared).
+        For Dirichlet multinomial: ``"atse"`` (per ATSE concentration) or ``"scalar"`` (single shared).
 
     # --- PartialEncoder knobs (used when splicing_architecture="partial") ---
     encoder_hidden_dim
-        Hidden width inside the PartialEncoder MLP.
-    encoder_type
-        One of:
-        ``"PartialEncoderEDDI"``, ``"PartialEncoderEDDIATSE"``,
-        ``"PartialEncoderWeightedSumEDDIMultiWeight"``,
-        ``"PartialEncoderWeightedSumEDDIMultiWeightATSE"``.
-    forward_style
-        Implementation style for PartialEncoder forward pass: ``"per-cell"``, ``"batched"``, or ``"scatter"``.
+        Hidden width inside the PartialEncoder MLP that maps pooled junction codes to latent statistics.
     code_dim
-        Dimensionality of per-feature embeddings in PartialEncoder.
+        Dimensionality of per junction embeddings in PartialEncoderEDDIFaster.
     h_hidden_dim
-        Hidden width of the shared “h” network in PartialEncoder.
+        Hidden width of the shared h network that processes (psi, feature_embedding) for each observed junction.
     pool_mode
-        Pooling across observed features: ``"mean"`` or ``"sum"``.
-    atse_embedding_dimension
-        ATSE embedding size for ATSE-aware encoder variants.
-    num_weight_vectors
-        Number of weight vectors for the WeightedSum variants.
-    temperature_value
-        Initial temperature for soft selection in WeightedSum variants (set <0 to use internal default).
-    temperature_fixed
-        If True, keep the temperature fixed; otherwise learn it.
+        Pooling across observed junctions per cell: ``"mean"`` or ``"sum"``.
     max_nobs
-        Cap for number of observations considered in the ``"scatter"`` path (−1 disables).
+        Optional cap on the number of observed (cell, junction) pairs processed in a single scatter chunk.
+        Set to a negative value to disable chunking.
 
     # --- Dataset shape/bookkeeping (inferred when possible) ---
     n_genes
@@ -360,19 +343,14 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
 
     # --- Model-only options ---
     initialize_embeddings_from_pca
-        If True and using a PartialEncoder, initialize its feature embedding via PCA on junction ratios.
+        If True and using the partial splicing architecture, initialize the per junction
+        embedding table via PCA on junction ratios.
     fully_paired
-        If True, the model exposes only a joint latent (no modality-specific latents).
+        If True, the model exposes only a joint latent (no modality specific latents).
 
     **model_kwargs
         Forwarded to :class:`~scvi.module.SPLICEVAE`.
-
-    Notes
-    -----
-    * This wrapper integrates only gene expression and splicing data.
-    * The splicing modality does not use library size factors.
     """
-
     _module_cls = SPLICEVAE
     _training_plan_cls = MyAdvTrainingPlan
 
@@ -413,20 +391,9 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
 
         # --- PartialEncoder knobs (splicing_architecture="partial") ---
         encoder_hidden_dim: int = 128,
-        encoder_type: Literal[
-            "PartialEncoderWeightedSumEDDIMultiWeight",
-            "PartialEncoderWeightedSumEDDIMultiWeightATSE",
-            "PartialEncoderEDDI",
-            "PartialEncoderEDDIATSE"
-        ] = "PartialEncoderEDDI",
-        forward_style: Literal["per-cell", "batched", "scatter"] = "scatter",
         code_dim: int = 16,
         h_hidden_dim: int = 64,
         pool_mode: Literal["mean", "sum"] = "mean",
-        atse_embedding_dimension: int = 16,
-        num_weight_vectors: int = 4,
-        temperature_value: float = -1.0,
-        temperature_fixed: bool = True,
         max_nobs: int = -1,
 
         # --- Model-only helpers ---
@@ -452,7 +419,6 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
         )
         use_size_factor_key = REGISTRY_KEYS.SIZE_FACTOR_KEY in self.adata_manager.data_registry
 
-        # ---- instantiate the module (pass every MODULE parameter, and only those) ----
         self.module = self._module_cls(
             n_input_genes=n_genes,
             n_input_junctions=n_junctions,
@@ -488,24 +454,17 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
             splicing_architecture=splicing_architecture,
             expression_architecture=expression_architecture,
 
-            # partial-encoder knobs
+            # partial encoder knobs
             encoder_hidden_dim=encoder_hidden_dim,
-            encoder_type=encoder_type,
-            forward_style=forward_style,
             code_dim=code_dim,
             h_hidden_dim=h_hidden_dim,
             pool_mode=pool_mode,
-            atse_embedding_dimension=atse_embedding_dimension,
-            num_weight_vectors=num_weight_vectors,
-            temperature_value=temperature_value,
-            temperature_fixed=temperature_fixed,
             max_nobs=max_nobs,
 
             # extras
             **model_kwargs,
         )
 
-        # ---- model summary (module + key model-only bits) ----
         self._model_summary_string = (
             f"SpliceVI | genes={n_genes}, junctions={n_junctions} | "
             f"n_hidden={self.module.n_hidden}, n_latent={self.module.n_latent}, "
@@ -516,11 +475,9 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
             f"splicing_loss={splicing_loss_type}, dm_conc={dm_concentration}, "
             f"sp_conc={splicing_concentration} | "
             f"mix={modality_weights}, penalty={modality_penalty} | "
-            f"PE(type={encoder_type}, code_dim={code_dim}, h_hidden={h_hidden_dim}, "
+            f"PE(code_dim={code_dim}, h_hidden={h_hidden_dim}, "
             f"enc_hidden={encoder_hidden_dim}, pool={pool_mode}, "
-            f"nW={num_weight_vectors}, temp={temperature_value}, "
-            f"temp_fixed={temperature_fixed}, fwd={forward_style}, "
-            f"max_nobs={max_nobs}, atse_emb={atse_embedding_dimension}) | "
+            f"max_nobs={max_nobs}) | "
             f"init_from_pca={initialize_embeddings_from_pca}"
         )
 
@@ -535,32 +492,13 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
         if self.adata is not None:
             if initialize_embeddings_from_pca and splicing_architecture == "partial":
                 self.init_feature_embedding_from_adata()
+
+            # Only needed for DM splicing likelihood
             if splicing_loss_type == "dirichlet_multinomial":
                 self.init_junc2atse()
-                if "atse" in encoder_type.lower():
-                    print("Registering junc2ATSE")
-                    self.module.z_encoder_splicing.register_junc2atse(self.module.junc2atse)
-                if "multi" in encoder_type.lower():
-                    print("Multi in encoder type")
-                    if self.module.z_encoder_splicing.temperature_value < 0.0:
-                        print("Resetting temperature value.")
-                        self.set_median_obs_temperature()
-    
-    def set_median_obs_temperature(self):
-        M = self.adata["splicing"].layers["psi_mask"]
-        if sp.issparse(M):
-            # per-row nonzeros, memory-light
-            counts = M.tocsr().getnnz(axis=1)
-            median_obs = np.median(counts)
-        else:
-            # works for bool or 0/1 dense
-            median_obs = np.median(np.count_nonzero(M, axis=1))
-
-        T = 1.0 / max(np.sqrt(float(median_obs)), 1.0)
-        print(f"Resetting temperature_value to 1/sqrt(median n_obs). median(n_obs)={median_obs}, T={T:.6f}")
-        self.module.z_encoder_splicing.temperature_value= T  # python float is fine
 
 
+        
     def make_junc2atse(self, atse_labels):
         print("Making Junc2Atse...")
         num_junctions = len(atse_labels)
@@ -580,16 +518,19 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
             values=torch.ones(len(row_indices), dtype=torch.float32),
             size=(num_junctions, len(atse_labels.cat.categories))
         ).coalesce()
-
+    
     def init_junc2atse(self) -> None:
+        # Return early if already set
+        if hasattr(self.module, "junc2atse"):
+            return
+
         cl_info = self.adata_manager.data_registry["atse_counts_key"]
         cl_key, mod_key = cl_info.attr_key, cl_info.mod_key
-        cluster_counts = self.adata[mod_key].layers[cl_key]
+        cluster_counts = self.adata[mod_key].layers[cl_key]  # existence check
         atse_labels = self.adata[mod_key].var["event_id"]
 
         j2a = self.make_junc2atse(atse_labels)
         self.module.junc2atse = j2a.coalesce().to(self.module.device)
-
 
 
     def init_feature_embedding_from_adata(self) -> None:

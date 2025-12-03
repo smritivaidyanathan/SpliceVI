@@ -13,7 +13,7 @@ from scvi import REGISTRY_KEYS
 from scvi.distributions import NegativeBinomial, NegativeBinomialMixture, ZeroInflatedNegativeBinomial
 from scvi.module.base import BaseModuleClass, LossOutput, auto_move_data
 from scvi.nn import DecoderSCVI, Encoder, FCLayers, LinearDecoderSCVI
-from partialvae import PartialEncoderEDDI, PartialEncoderEDDIATSE,PartialEncoderWeightedSumEDDIMultiWeight, PartialEncoderWeightedSumEDDIMultiWeightATSE, PartialEncoderEDDIFast, PartialEncoderEDDIATSEFast,PartialEncoderWeightedSumEDDIMultiWeightFast, PartialEncoderWeightedSumEDDIMultiWeightATSEFast, PartialEncoderEDDIFaster, PartialEncoderEDDIATSEFaster,PartialEncoderWeightedSumEDDIMultiWeightFaster, PartialEncoderWeightedSumEDDIMultiWeightATSEFaster, LinearDecoder, group_logsumexp, subtract_group_logsumexp, nbetaln
+from partialvae import PartialEncoderEDDIFaster, LinearDecoder, group_logsumexp, subtract_group_logsumexp, nbetaln
 
 
 
@@ -103,21 +103,21 @@ def masked_softmax(weights, mask, dim=-1, eps=1e-30):
 
 class SPLICEVAE(BaseModuleClass):
     """
-    Variational auto-encoder for joint (paired or unpaired) RNA-seq gene expression
-    and alternative splicing (junction usage). Two encoder–decoder branches (expression,
-    splicing) produce/posterior latents that are mixed into a shared latent space z.
+    Variational auto encoder for joint (paired or unpaired) RNA-seq gene expression
+    and alternative splicing (junction usage). Two encoder–decoder branches (expression
+    and splicing) produce posterior latents that are mixed into a shared latent space z.
 
-    Reconstruction is performed per modality; optional penalties align the two posteriors.
+    Reconstruction is performed per modality. Optional penalties align the two posteriors.
 
     Parameters
     ----------
     # --- Data & bookkeeping ---
     n_input_genes : int
-        Number of gene-expression features (G).
+        Number of gene expression features (G).
     n_input_junctions : int
         Number of splicing junction features (J).
     n_batch : int, default 0
-        Number of batches for batch-correction (categorical covariate).
+        Number of batches for batch correction (categorical covariate).
     n_obs : int, default 0
         Number of observations (cells); needed when modality_weights="cell".
     n_labels : int, default 0
@@ -133,125 +133,84 @@ class SPLICEVAE(BaseModuleClass):
     gene_dispersion : {"gene","gene-batch","gene-label","gene-cell"}, default "gene"
         Dispersion layout for expression.
     use_size_factor_key : bool, default False
-        If True, use provided library-size factors for expression (softplus scale);
-        else learn a library-size encoder (see LibrarySizeEncoder).
+        If True, use provided library size factors for expression. Otherwise learn a
+        library size encoder.
 
     # --- Architecture toggles ---
     splicing_architecture : {"vanilla","partial"}, default "vanilla"
-        • "vanilla": SCVI Encoder + (nonlinear) DecoderSplice (FCLayers).  
-        • "partial": PartialEncoder* variants + Linear splicing decoder.
+        "vanilla" uses a standard SCVI Encoder plus DecoderSplice.
+        "partial" uses PartialEncoderEDDIFaster plus a linear splicing decoder.
     expression_architecture : {"vanilla","linear"}, default "vanilla"
         Decoder for expression:
-        • "vanilla": non-linear DecoderSCVI (FCLayers).  
-        • "linear" : LinearDecoderSCVI.
+        "vanilla" uses a non linear DecoderSCVI.
+        "linear" uses a LinearDecoderSCVI.
 
-    # --- Shared SCVI-style encoder/decoder hyperparameters (used by expression
-    #     encoder/decoder, LibrarySizeEncoder, and splicing *when* splicing_architecture="vanilla") ---
+    # --- Shared SCVI-style encoder/decoder hyperparameters ---
     n_hidden : int or None, default None
-        Hidden width for SCVI-style MLPs. If None, defaults to ~sqrt(J) (cap at 128) or sqrt(G).
+        Hidden width for SCVI style MLPs. If None, defaults to roughly sqrt(J) capped at 128.
     n_latent : int or None, default None
-        Latent dimensionality. If None, defaults to ~sqrt(n_hidden). When
-        modality_weights="concatenate", the *mixed* latent is doubled internally.
+        Latent dimensionality. If None, defaults to roughly sqrt(n_hidden).
+        When modality_weights="concatenate", the mixed latent is doubled internally.
     n_layers_encoder : int, default 2
-        Depth of SCVI encoders (expression, and splicing if "vanilla").
+        Depth of SCVI encoders (expression branch and splicing branch when splicing_architecture="vanilla").
+        Also controls the depth of the post pooling MLP in the partial splicing encoder.
     n_layers_decoder : int, default 2
-        Depth of non-linear decoders (expression "vanilla", splicing "vanilla").
+        Depth of non linear decoders (expression "vanilla", splicing "vanilla").
         Not used by linear decoders.
-
     dropout_rate : float, default 0.1
-        Dropout for SCVI-style MLPs.
+        Dropout for SCVI style MLPs.
     use_batch_norm : {"encoder","decoder","none","both"}, default "none"
-        Apply BatchNorm to encoder/decoder stacks.
+        Apply BatchNorm to encoder or decoder stacks.
     use_layer_norm : {"encoder","decoder","none","both"}, default "both"
-        Apply LayerNorm to encoder/decoder stacks.
+        Apply LayerNorm to encoder or decoder stacks.
     latent_distribution : {"normal","ln"}, default "normal"
-        Posterior family for encoders. If "ln" (logistic-normal), the latent sample is
-        softmax-transformed before decoding.
+        Posterior family for encoders. If "ln" (logistic normal), the latent sample is
+        softmax transformed before decoding.
 
     deeply_inject_covariates : bool, default False
-        Deeply inject (cat/cont) covariates into decoder layers.
+        Deeply inject categorical and continuous covariates into decoder layers.
     encode_covariates : bool, default False
         Concatenate continuous covariates to encoder inputs and pass categorical
-        covariates via `n_cat_list`.
+        covariates via n_cat_list.
 
     # --- Splicing likelihood ---
     splicing_loss_type : {"binomial","beta_binomial","dirichlet_multinomial"}, default "beta_binomial"
         Reconstruction loss for splicing.
-        • "binomial": needs (junc_counts, atse_counts).  
-        • "beta_binomial": same as binomial but with concentration φ_j (per junction).  
-        • "dirichlet_multinomial": uses grouped softmax within ATSEs.
+        "binomial" expects junction counts and ATSE totals.
+        "beta_binomial" uses a beta binomial with a learned concentration.
+        "dirichlet_multinomial" uses grouped softmax within ATSEs.
     splicing_concentration : float or None, default None
-        Optional scalar concentration (used by beta-binomial if provided).
+        Optional scalar concentration for the beta binomial case.
     dm_concentration : {"atse","scalar"}, default "atse"
-        For Dirichlet–multinomial: whether φ is per-ATSE or a global scalar
-        (internally mapped to per-junction as needed).
+        For Dirichlet multinomial. Controls whether the concentration is per ATSE or scalar.
 
-    # --- PartialEncoder (splicing_architecture="partial") knobs ONLY ---
-    encoder_type : {"PartialEncoderEDDI","PartialEncoderEDDIATSE",
-                    "PartialEncoderWeightedSumEDDIMultiWeight",
-                    "PartialEncoderWeightedSumEDDIMultiWeightATSE"}, default "PartialEncoderEDDI"
-        Choice of PartialEncoder family/variant (ATSE-aware and/or weighted-sum gating).
-    forward_style : {"per-cell","batched","scatter"}, default "batched"
-        Implementation variant for speed/memory trade-offs (Fast/Faster classes under the hood).
+    # --- PartialEncoder knobs (splicing_architecture="partial") ---
     code_dim : int, default 16
-        Dimensionality of per-junction codes before pooling.
+        Dimensionality of per junction codes before pooling.
     h_hidden_dim : int, default 64
-        Hidden width of the per-junction “h” subnetwork (feature MLP) that builds codes.
+        Hidden width of the per junction h subnetwork that combines PSI and feature embedding.
     encoder_hidden_dim : int, default 128
-        Hidden width of the post-pooling MLP that maps pooled features → (μ, logσ²) of z.
+        Hidden width of the post pooling MLP that maps the pooled code to (mu, log var) of z.
     pool_mode : {"mean","sum"}, default "mean"
-        Aggregation of per-junction codes within each cell (and within ATSEs when applicable).
-    atse_embedding_dimension : int, default 16
-        ATSE-level embedding size (ATSE-aware variants only).
-    num_weight_vectors : int, default 4
-        Number of mixture weight vectors for MultiWeight variants.
-    temperature_value : float, default -1.0
-        Initial temperature for gating (if <0, use internal default).
-    temperature_fixed : bool, default True
-        If True, keep gating temperature fixed; else learn it.
+        Aggregation of per junction codes within each cell.
     max_nobs : int, default -1
-        (scatter mode) Optional cap on observed entries processed per step.
+        Optional cap on the number of observed entries processed in each scatter chunk.
+        A negative value disables chunking.
 
     # --- Modality mixing ---
     modality_weights : {"equal","cell","universal","concatenate"}, default "equal"
-        How to combine expression & splicing posteriors:
-        • "equal"     : uniform weights.  
-        • "universal" : learn one weight per modality.  
-        • "cell"      : learn weights per cell.  
-        • "concatenate": do not mix; concat latents (z_expr || z_spl).
+        How to combine expression and splicing posteriors.
     modality_penalty : {"Jeffreys","MMD","None"}, default "Jeffreys"
         Alignment penalty between the two posteriors on paired cells.
 
-    **model_kwargs :
-        Forwarded to underlying components (encoders/decoders).
+    **model_kwargs
+        Forwarded to underlying components.
 
     Notes
     -----
-    • SCVI-style hyperparameters (`n_hidden`, `n_layers_encoder/decoder`, `dropout_rate`,
-      normalization flags) control the expression branch and the splicing branch only when
-      `splicing_architecture="vanilla"`. They do **not** affect PartialEncoder internals.
-
-    • PartialEncoder-specific widths:
-        - `h_hidden_dim`   : per-junction feature network width.
-        - `encoder_hidden_dim` : post-pooling MLP width (to z stats).
-        - `code_dim`       : per-junction code dimensionality before pooling.
-
-    • If `latent_distribution="ln"`, both encoders output logits that are softmaxed into
-      simplex-valued latents prior to decoding.
-
-    • Splicing losses:
-        - Binomial/Beta-binomial expect `junc_counts` (successes) and `atse_counts`
-          (trials). Beta-binomial uses φ_j = softplus(log_phi_j); an L2 prior on log_phi_j
-          is applied during training.
-        - Dirichlet–multinomial performs ATSE-wise softmax and supports φ as scalar or
-          per-ATSE; values are mapped to per-junction when needed.
-
-    • When `modality_weights="concatenate"`, the *mixed* latent doubles its size
-      (z = [z_expr, z_spl]); penalties are skipped in this mode.
-
-    • Protein modality is not supported. AnnData/MuData handling occurs in the model
-      wrapper (AnnDataManager in setup).
-
+    The partial splicing branch uses a single PartialEncoderEDDIFaster encoder that
+    aggregates only observed junctions per cell. The same n_layers_encoder parameter
+    controls the depth of the final MLP that produces latent statistics for this branch.
     """
 
     def __init__(
@@ -292,21 +251,10 @@ class SPLICEVAE(BaseModuleClass):
         dm_concentration: Literal["atse", "scalar"] = "atse",
 
         # --- PartialEncoder (splicing_architecture="partial") knobs ---
-        encoder_type: Literal[
-            "PartialEncoderWeightedSumEDDIMultiWeight",
-            "PartialEncoderWeightedSumEDDIMultiWeightATSE",
-            "PartialEncoderEDDI",
-            "PartialEncoderEDDIATSE"
-        ] = "PartialEncoderEDDI",
-        forward_style: Literal["per-cell", "batched", "scatter"] = "batched",
         code_dim: int = 16,
         h_hidden_dim: int = 64,
         encoder_hidden_dim: int = 128,
         pool_mode: Literal["mean", "sum"] = "mean",
-        atse_embedding_dimension: int = 16,
-        num_weight_vectors: int = 4,
-        temperature_value: float = -1.0,
-        temperature_fixed: bool = True,
         max_nobs: int = -1,
 
         # --- Modality mixing ---
@@ -440,9 +388,7 @@ class SPLICEVAE(BaseModuleClass):
             self.log_phi_j = nn.Parameter(torch.tensor(0.0))
             self.log_phi_j.requires_grad_(False)
 
-        
-
-        if (splicing_architecture=="vanilla"):
+        if (splicing_architecture == "vanilla"):
             self.z_encoder_splicing = Encoder(
                 n_input=n_input_encoder_spl,
                 n_layers=n_layers_encoder,
@@ -469,210 +415,36 @@ class SPLICEVAE(BaseModuleClass):
                 deep_inject_covariates=deeply_inject_covariates,
             )
         else:
+            # Partial splicing encoder: PartialEncoderEDDIFaster only
+            self.z_encoder_splicing = PartialEncoderEDDIFaster(
+                input_dim=input_spl,
+                code_dim=code_dim,
+                h_hidden_dim=h_hidden_dim,
+                encoder_hidden_dim=encoder_hidden_dim,
+                latent_dim=self.encoder_latent_dim,
+                dropout_rate=dropout_rate,
+                n_cat_list=encoder_cat_list,
+                n_cont=n_continuous_cov,
+                inject_covariates=encode_covariates,
+                pool_mode=pool_mode,
+                max_nobs=max_nobs,
+                encoder_n_layers=n_layers_encoder,
+            )
 
-            # instantiate the requested encoder
-            if forward_style == "per-cell":
-                if encoder_type == "PartialEncoderEDDI":
-                    print(f"Using EDDI Partial Encoder")
-                    self.z_encoder_splicing = PartialEncoderEDDI(
-                        input_dim=input_spl,
-                        code_dim=code_dim,
-                        h_hidden_dim=h_hidden_dim,
-                        encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=self.encoder_latent_dim,
-                        dropout_rate=dropout_rate,
-                        n_cat_list=encoder_cat_list,
-                        n_cont=n_continuous_cov,
-                        inject_covariates=encode_covariates,
-                        pool_mode=pool_mode,
-                    )
+            if latent_distribution == "ln":
+                self.z_encoder_splicing.z_transformation = nn.Softmax(dim=-1)
+            else:
+                self.z_encoder_splicing.z_transformation = lambda x: x
 
-                elif encoder_type == "PartialEncoderEDDIATSE":
-                    print("Using EDDI + ATSE Partial Encoder")
-                    self.z_encoder_splicing = PartialEncoderEDDIATSE(
-                        input_dim=input_spl,
-                        code_dim=code_dim,
-                        h_hidden_dim=h_hidden_dim,
-                        encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=self.encoder_latent_dim,
-                        dropout_rate=dropout_rate,
-                        n_cat_list=encoder_cat_list,
-                        n_cont=n_continuous_cov,
-                        inject_covariates=encode_covariates,
-                        pool_mode=pool_mode,
-                        atse_embedding_dimension=atse_embedding_dimension
-                    )
-                
-                elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeight":
-                    print("Using PartialEncoderWeightedSumEDDIMultiWeight")
-                    self.z_encoder_splicing = PartialEncoderWeightedSumEDDIMultiWeight(
-                        input_dim=input_spl,
-                        code_dim=code_dim,
-                        h_hidden_dim=h_hidden_dim,
-                        encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=self.encoder_latent_dim,
-                        dropout_rate=dropout_rate,
-                        n_cat_list=encoder_cat_list,
-                        n_cont=n_continuous_cov,
-                        inject_covariates=encode_covariates,
-                        num_weight_vectors = num_weight_vectors,
-                        temperature_value=temperature_value,
-                        temperature_fixed=temperature_fixed,
-                    )
+            input_linear_splicing_decoder = self.n_latent
 
-                elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeightATSE":
-                    print("Using PartialEncoderWeightedSumEDDIMultiWeightATSE")
-                    self.z_encoder_splicing = PartialEncoderWeightedSumEDDIMultiWeightATSE(
-                        input_dim=input_spl,
-                        code_dim=code_dim,
-                        h_hidden_dim=h_hidden_dim,
-                        encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=self.encoder_latent_dim,
-                        dropout_rate=dropout_rate,
-                        n_cat_list=encoder_cat_list,
-                        n_cont=n_continuous_cov,
-                        inject_covariates=encode_covariates,
-                        num_weight_vectors = num_weight_vectors,
-                        temperature_value=temperature_value,
-                        temperature_fixed=temperature_fixed,
-                        atse_embedding_dimension=atse_embedding_dimension
-                    )
-            elif forward_style == "batched":
-                if encoder_type == "PartialEncoderEDDI":
-                    print(f"Using EDDI Partial Encoder Fast")
-                    self.z_encoder_splicing = PartialEncoderEDDIFast(
-                        input_dim=input_spl,
-                        code_dim=code_dim,
-                        h_hidden_dim=h_hidden_dim,
-                        encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=self.encoder_latent_dim,
-                        dropout_rate=dropout_rate,
-                        n_cat_list=encoder_cat_list,
-                        n_cont=n_continuous_cov,
-                        inject_covariates=encode_covariates,
-                        pool_mode=pool_mode,
-                    )
+            self.z_decoder_splicing = LinearDecoder(
+                latent_dim=input_linear_splicing_decoder,
+                output_dim=n_input_junctions,
+                n_cat_list=cat_list,
+                n_cont=n_continuous_cov,
+            )
 
-                elif encoder_type == "PartialEncoderEDDIATSE":
-                    print("Using EDDI + ATSE Partial Encoder Fast")
-                    self.z_encoder_splicing = PartialEncoderEDDIATSEFast(
-                        input_dim=input_spl,
-                        code_dim=code_dim,
-                        h_hidden_dim=h_hidden_dim,
-                        encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=self.encoder_latent_dim,
-                        dropout_rate=dropout_rate,
-                        n_cat_list=encoder_cat_list,
-                        n_cont=n_continuous_cov,
-                        inject_covariates=encode_covariates,
-                        pool_mode=pool_mode,
-                        atse_embedding_dimension=atse_embedding_dimension
-                    )
-                
-                elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeight":
-                    print("Using PartialEncoderWeightedSumEDDIMultiWeight Fast")
-                    self.z_encoder_splicing = PartialEncoderWeightedSumEDDIMultiWeightFast(
-                        input_dim=input_spl,
-                        code_dim=code_dim,
-                        h_hidden_dim=h_hidden_dim,
-                        encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=self.encoder_latent_dim,
-                        dropout_rate=dropout_rate,
-                        n_cat_list=encoder_cat_list,
-                        n_cont=n_continuous_cov,
-                        inject_covariates=encode_covariates,
-                        num_weight_vectors = num_weight_vectors,
-                        temperature_value=temperature_value,
-                        temperature_fixed=temperature_fixed,
-                    )
-
-                elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeightATSE":
-                    print("Using PartialEncoderWeightedSumEDDIMultiWeightATSE Fast")
-                    self.z_encoder_splicing = PartialEncoderWeightedSumEDDIMultiWeightATSEFast(
-                        input_dim=input_spl,
-                        code_dim=code_dim,
-                        h_hidden_dim=h_hidden_dim,
-                        encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=self.encoder_latent_dim,
-                        dropout_rate=dropout_rate,
-                        n_cat_list=encoder_cat_list,
-                        n_cont=n_continuous_cov,
-                        inject_covariates=encode_covariates,
-                        num_weight_vectors = num_weight_vectors,
-                        temperature_value=temperature_value,
-                        temperature_fixed=temperature_fixed,
-                        atse_embedding_dimension=atse_embedding_dimension
-                    )
-            elif forward_style == "scatter":
-                if encoder_type == "PartialEncoderEDDI":
-                    print(f"Using EDDI Partial Encoder Faster")
-                    self.z_encoder_splicing = PartialEncoderEDDIFaster(
-                        input_dim=input_spl,
-                        code_dim=code_dim,
-                        h_hidden_dim=h_hidden_dim,
-                        encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=self.encoder_latent_dim,
-                        dropout_rate=dropout_rate,
-                        n_cat_list=encoder_cat_list,
-                        n_cont=n_continuous_cov,
-                        inject_covariates=encode_covariates,
-                        pool_mode=pool_mode,
-                        max_nobs = max_nobs,
-                    )
-
-                elif encoder_type == "PartialEncoderEDDIATSE":
-                    print("Using EDDI + ATSE Partial Encoder Faster")
-                    self.z_encoder_splicing = PartialEncoderEDDIATSEFaster(
-                        input_dim=input_spl,
-                        code_dim=code_dim,
-                        h_hidden_dim=h_hidden_dim,
-                        encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=self.encoder_latent_dim,
-                        dropout_rate=dropout_rate,
-                        n_cat_list=encoder_cat_list,
-                        n_cont=n_continuous_cov,
-                        inject_covariates=encode_covariates,
-                        pool_mode=pool_mode,
-                        atse_embedding_dimension=atse_embedding_dimension,
-                    )
-
-                elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeight":
-                    print("Using PartialEncoderWeightedSumEDDIMultiWeight Faster")
-                    self.z_encoder_splicing = PartialEncoderWeightedSumEDDIMultiWeightFaster(
-                        input_dim=input_spl,
-                        code_dim=code_dim,
-                        h_hidden_dim=h_hidden_dim,
-                        encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=self.encoder_latent_dim,
-                        dropout_rate=dropout_rate,
-                        n_cat_list=encoder_cat_list,
-                        n_cont=n_continuous_cov,
-                        inject_covariates=encode_covariates,
-                        num_weight_vectors=num_weight_vectors,
-                        temperature_value=temperature_value,
-                        temperature_fixed=temperature_fixed,
-                    )
-
-                elif encoder_type == "PartialEncoderWeightedSumEDDIMultiWeightATSE":
-                    print("Using PartialEncoderWeightedSumEDDIMultiWeightATSE Faster")
-                    self.z_encoder_splicing = PartialEncoderWeightedSumEDDIMultiWeightATSEFaster(
-                        input_dim=input_spl,
-                        code_dim=code_dim,
-                        h_hidden_dim=h_hidden_dim,
-                        encoder_hidden_dim=encoder_hidden_dim,
-                        latent_dim=self.encoder_latent_dim,
-                        dropout_rate=dropout_rate,
-                        n_cat_list=encoder_cat_list,
-                        n_cont=n_continuous_cov,
-                        inject_covariates=encode_covariates,
-                        num_weight_vectors=num_weight_vectors,
-                        temperature_value=temperature_value,
-                        temperature_fixed=temperature_fixed,
-                        atse_embedding_dimension=atse_embedding_dimension,
-                    )
-
-                else:
-                    raise ValueError(f"Unknown encoder_type={encoder_type!r}")
                 
 
             if latent_distribution == "ln":

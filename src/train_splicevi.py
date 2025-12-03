@@ -37,6 +37,19 @@ def maybe_import_wandb():
     return wandb, WandbLogger
 
 
+def str2bool(v):
+    """Parse common string/int representations into bools for argparse."""
+    if isinstance(v, bool) or v is None:
+        return v
+    if isinstance(v, str):
+        v_lower = v.lower()
+        if v_lower in {"yes", "true", "t", "y", "1"}:
+            return True
+        if v_lower in {"no", "false", "f", "n", "0", "none", ""}:
+            return False
+    raise argparse.ArgumentTypeError("Boolean value expected.")
+
+
 def build_argparser(init_defaults, train_defaults):
     parser = argparse.ArgumentParser(
         "train_multivisplice_basic",
@@ -99,7 +112,12 @@ def build_argparser(init_defaults, train_defaults):
 
     # Optional: override SPLICEVI __init__ arguments
     for name, default in init_defaults.items():
-        arg_type = type(default) if default is not None else float
+        if isinstance(default, bool):
+            arg_type = str2bool
+        elif default is not None:
+            arg_type = type(default)
+        else:
+            arg_type = float
         parser.add_argument(
             f"--{name}",
             type=arg_type,
@@ -109,7 +127,12 @@ def build_argparser(init_defaults, train_defaults):
 
     # Optional: override SPLICEVI.train arguments
     for name, default in train_defaults.items():
-        arg_type = type(default) if default is not None else float
+        if isinstance(default, bool):
+            arg_type = str2bool
+        elif default is not None:
+            arg_type = type(default)
+        else:
+            arg_type = float
         parser.add_argument(
             f"--{name}",
             type=arg_type,

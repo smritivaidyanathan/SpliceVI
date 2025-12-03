@@ -49,14 +49,28 @@ N_LATENT=25             # Latent dimensionality
 DROPOUT_RATE=0.01       # Model dropout rate
 SPLICING_LOSS_TYPE="dirichlet_multinomial"  # binomial | beta_binomial | dirichlet_multinomial
 
-# 4) Optional architecture knobs (only passed if you care to set them)
-FORWARD_STYLE="scatter"              # per-cell | batched | scatter
-MAX_NOBS=50000                       # Subsampling cap for number of observations
-ENCODER_HIDDEN_DIM=128
-H_HIDDEN_DIM=64
-ATSE_EMBEDDING_DIMENSION=16
+# 4) Optional architecture knobs (SPLICEVI __init__ parameters)
+MODALITY_WEIGHTS="equal"             # equal | cell | universal | concatenate
+MODALITY_PENALTY="Jeffreys"          # Jeffreys | MMD | None
+N_LAYERS_ENCODER=2
+N_LAYERS_DECODER=2                   # not used if linear
+USE_BATCH_NORM="none"                # encoder | decoder | none | both
+USE_LAYER_NORM="both"                # encoder | decoder | none | both
+LATENT_DISTRIBUTION="normal"         # normal | ln
+DEEPLY_INJECT_COVARIATES=false
+ENCODE_COVARIATES=false
+GENE_LIKELIHOOD="zinb"               # zinb | nb | poisson
+DISPERSION="gene"                    # gene | gene-batch | gene-label | gene-cell
+DM_CONCENTRATION="atse"              # atse | scalar
 SPLICING_ARCHITECTURE="partial"      # vanilla | partial
 EXPRESSION_ARCHITECTURE="linear"     # vanilla | linear
+ENCODER_HIDDEN_DIM=128
+CODE_DIM=32
+H_HIDDEN_DIM=64
+POOL_MODE="mean"                     # mean | sum
+MAX_NOBS=-1                          # cap for scatter chunking (-1 disables)
+INITIALIZE_EMBEDDINGS_FROM_PCA=false
+FULLY_PAIRED=false
 
 WEIGHT_DECAY=1e-3
 EARLY_STOPPING_PATIENCE=50
@@ -153,13 +167,27 @@ python "${SCRIPT_PATH}" \
   --n_latent "${N_LATENT}" \
   --dropout_rate "${DROPOUT_RATE}" \
   --splicing_loss_type "${SPLICING_LOSS_TYPE}" \
-  --max_nobs "${MAX_NOBS}" \
-  --forward_style "${FORWARD_STYLE}" \
+  --modality_weights "${MODALITY_WEIGHTS}" \
+  --modality_penalty "${MODALITY_PENALTY}" \
+  --n_layers_encoder "${N_LAYERS_ENCODER}" \
+  --n_layers_decoder "${N_LAYERS_DECODER}" \
+  --use_batch_norm "${USE_BATCH_NORM}" \
+  --use_layer_norm "${USE_LAYER_NORM}" \
+  --latent_distribution "${LATENT_DISTRIBUTION}" \
+  --deeply_inject_covariates "${DEEPLY_INJECT_COVARIATES}" \
+  --encode_covariates "${ENCODE_COVARIATES}" \
+  --gene_likelihood "${GENE_LIKELIHOOD}" \
+  --dispersion "${DISPERSION}" \
+  --dm_concentration "${DM_CONCENTRATION}" \
   --encoder_hidden_dim "${ENCODER_HIDDEN_DIM}" \
+  --code_dim "${CODE_DIM}" \
   --h_hidden_dim "${H_HIDDEN_DIM}" \
-  --atse_embedding_dimension "${ATSE_EMBEDDING_DIMENSION}" \
+  --pool_mode "${POOL_MODE}" \
+  --max_nobs "${MAX_NOBS}" \
   --splicing_architecture "${SPLICING_ARCHITECTURE}" \
   --expression_architecture "${EXPRESSION_ARCHITECTURE}" \
+  --initialize_embeddings_from_pca "${INITIALIZE_EMBEDDINGS_FROM_PCA}" \
+  --fully_paired "${FULLY_PAIRED}" \
   --weight_decay "${WEIGHT_DECAY}" \
   --early_stopping_patience "${EARLY_STOPPING_PATIENCE}" \
   --lr_scheduler_type "${LR_SCHEDULER_TYPE}" \
