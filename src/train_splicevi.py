@@ -72,6 +72,12 @@ def build_argparser(init_defaults, train_defaults):
         required=True,
         help="Output directory to save the trained model.",
     )
+    parser.add_argument(
+        "--batch_key",
+        type=str,
+        default="None",
+        help="Optional obs column used as batch_key in setup_mudata. Use 'None' to disable.",
+    )
 
     # Optional: W&B integration
     parser.add_argument(
@@ -207,10 +213,12 @@ def main():
     # ------------------------------
     # 4. Setup SPLICEVI
     # ------------------------------
+    batch_key = None if (args.batch_key is None or str(args.batch_key).lower() == "none") else args.batch_key
+    print(f"[MODEL] Using batch_key      : {batch_key}")
     print("[MODEL] Setting up SPLICEVI with standard MuData configuration...")
     SPLICEVI.setup_mudata(
         mdata,
-        batch_key=None,
+        batch_key=batch_key,
         size_factor_key="X_library_size",
         rna_layer="length_norm",
         junc_ratio_layer=x_layer,

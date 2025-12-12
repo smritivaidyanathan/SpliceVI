@@ -31,6 +31,7 @@ import pandas as pd
 import torch
 
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 import seaborn as sns
 
 from sklearn.decomposition import PCA
@@ -439,7 +440,8 @@ def build_argparser():
         type=int,
         default=None,
         help=(
-            "Currently unused in plotting logic. Kept for compatibility with old configs."
+            "Highlight up to N most frequent cell types when building UMAP palettes. "
+            "If not set, uses all categories."
         ),
     )
     parser.add_argument(
@@ -637,14 +639,42 @@ def main():
         else umap_color_key
     )
 
-    # UMAP obs keys list
+    # Highlight top cell types (or all) for UMAP coloring
+    highlight_key = (
+        "medium_cell_type"
+        if "medium_cell_type" in mdata_train["rna"].obs.columns
+        else cell_type_classification_key
+    )
+    highlight_series = mdata_train["rna"].obs[highlight_key].astype(str)
+    counts = highlight_series.value_counts()
+    top_n = args.umap_top_n_celltypes
+    top_groups = (
+        counts.head(top_n).index.tolist()
+        if top_n is not None
+        else counts.index.tolist()
+    )
+    mdata_train["rna"].obs["group_highlighted"] = "Other"
+    mdata_train["rna"].obs.loc[
+        mdata_train["rna"].obs[highlight_key].isin(top_groups), "group_highlighted"
+    ] = mdata_train["rna"].obs[highlight_key]
+
+    cmap = cm.get_cmap("tab20", max(len(top_groups), 1))
+    colors = [cmap(i) for i in range(len(top_groups))]
+    color_dict = {group: colors[i] for i, group in enumerate(top_groups)}
+    color_dict["Other"] = (0.9, 0.9, 0.9, 1.0)
+
+    # UMAP obs keys list (always include highlighted groups first)
     if args.umap_obs_keys is not None:
-        umap_obs_keys = args.umap_obs_keys
+        umap_obs_keys = list(dict.fromkeys(args.umap_obs_keys))
+        if "group_highlighted" not in umap_obs_keys:
+            umap_obs_keys.insert(0, "group_highlighted")
         print(f"[UMAP] Using user-provided UMAP obs keys: {umap_obs_keys}")
     else:
-        umap_obs_keys = [umap_color_key]
+        umap_obs_keys = ["group_highlighted"]
         if cell_type_classification_key != umap_color_key:
-            umap_obs_keys.append(cell_type_classification_key)
+            umap_obs_keys.extend([umap_color_key, cell_type_classification_key])
+        else:
+            umap_obs_keys.append(umap_color_key)
         print(f"[UMAP] UMAP obs keys not provided; using defaults: {umap_obs_keys}")
 
     # Latent spaces
@@ -704,13 +734,17 @@ def main():
                     f"[EVAL/UMAP] Plotting TRAIN UMAP for latent '{name}' colored by '{obs_key}'..."
                 )
 
-                fig, ax = plt.subplots(figsize=(7, 7))
-                ax.set_aspect("equal")
+                fig, ax = plt.subplots(figsize=(5, 5))
+                ax.set_box_aspect(1)
+                ax.set_aspect(1)
+
+                palette = color_dict if obs_key == "group_highlighted" else None
 
                 sc.pl.embedding(
                     mdata_train["rna"],
                     basis=key_umap,
                     color=obs_key,
+                    palette=palette,
                     show=False,
                     frameon=True,
                     legend_fontsize=10,
@@ -718,9 +752,9 @@ def main():
                     ax=ax,
                 )
 
-                ax.set_aspect("equal")
-                title = f"TRAIN UMAP ({name}) colored by {obs_key}"
-                plt.title(title)
+                ax.set_xlabel("UMAP1")
+                ax.set_ylabel("UMAP2")
+                plt.title(f"SpliceVI $Z_{{{name.capitalize()}}}$")
                 plt.tight_layout()
 
                 safe_obs = re.sub(r"[^A-Za-z0-9]+", "_", obs_key)

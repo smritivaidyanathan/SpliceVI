@@ -285,10 +285,14 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
         Expression dispersion parameterization: ``"gene"``, ``"gene-batch"``, ``"gene-label"``, or ``"gene-cell"``.
 
     # --- Architecture toggles ---
-    splicing_architecture
-        Splicing branch type:
-        * ``"vanilla"`` – SCVI `Encoder` + `DecoderSplice`,
-        * ``"partial"`` – `PartialEncoderEDDIFaster` + `LinearDecoder`.
+    splicing_encoder_architecture
+        Splicing encoder:
+        * ``"vanilla"`` – SCVI `Encoder`,
+        * ``"partial"`` – `PartialEncoderEDDIFaster`.
+    splicing_decoder_architecture
+        Splicing decoder:
+        * ``"vanilla"`` – nonlinear `DecoderSplice`,
+        * ``"linear"`` – linear decoder.
     expression_architecture
         Expression decoder: ``"vanilla"`` (nonlinear) or ``"linear"`` (linear decoder).
 
@@ -322,7 +326,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
     dm_concentration
         For Dirichlet multinomial: ``"atse"`` (per ATSE concentration) or ``"scalar"`` (single shared).
 
-    # --- PartialEncoder knobs (used when splicing_architecture="partial") ---
+    # --- PartialEncoder knobs (used when splicing_encoder_architecture="partial") ---
     encoder_hidden_dim
         Hidden width inside the PartialEncoder MLP that maps pooled junction codes to latent statistics.
     code_dim
@@ -343,8 +347,8 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
 
     # --- Model-only options ---
     initialize_embeddings_from_pca
-        If True and using the partial splicing architecture, initialize the per junction
-        embedding table via PCA on junction ratios.
+        If True and using the partial splicing encoder, initialize the per junction embedding
+        table via PCA on junction ratios.
     fully_paired
         If True, the model exposes only a joint latent (no modality specific latents).
 
@@ -386,7 +390,8 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
         splicing_concentration: float | None = None,
 
         # --- Architecture toggles ---
-        splicing_architecture: Literal["vanilla", "partial"] = "partial",
+        splicing_encoder_architecture: Literal["vanilla", "partial"] = "partial",
+        splicing_decoder_architecture: Literal["vanilla", "linear"] = "linear",
         expression_architecture: Literal["vanilla", "linear"] = "linear",
 
         # --- PartialEncoder knobs (splicing_architecture="partial") ---
@@ -451,7 +456,8 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
             dm_concentration=dm_concentration,
 
             # architectures
-            splicing_architecture=splicing_architecture,
+            splicing_encoder_architecture=splicing_encoder_architecture,
+            splicing_decoder_architecture=splicing_decoder_architecture,
             expression_architecture=expression_architecture,
 
             # partial encoder knobs
@@ -470,7 +476,8 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
             f"n_hidden={self.module.n_hidden}, n_latent={self.module.n_latent}, "
             f"enc_layers={n_layers_encoder}, dec_layers={n_layers_decoder}, "
             f"dropout={dropout_rate}, z_dist={latent_distribution} | "
-            f"expr_dec={expression_architecture}, spl_arch={splicing_architecture} | "
+            f"expr_dec={expression_architecture}, spl_enc={splicing_encoder_architecture}, "
+            f"spl_dec={splicing_decoder_architecture} | "
             f"gene_like={gene_likelihood}, disp={dispersion} | "
             f"splicing_loss={splicing_loss_type}, dm_conc={dm_concentration}, "
             f"sp_conc={splicing_concentration} | "
@@ -490,7 +497,7 @@ class SPLICEVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass, ArchesMixin)
         self.dm_concentration = dm_concentration
 
         if self.adata is not None:
-            if initialize_embeddings_from_pca and splicing_architecture == "partial":
+            if initialize_embeddings_from_pca and splicing_encoder_architecture == "partial":
                 self.init_feature_embedding_from_adata()
 
             # Only needed for DM splicing likelihood

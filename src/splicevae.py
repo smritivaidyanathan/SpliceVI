@@ -137,11 +137,16 @@ class SPLICEVAE(BaseModuleClass):
         library size encoder.
 
     # --- Architecture toggles ---
-    splicing_architecture : {"vanilla","partial"}, default "vanilla"
-        "vanilla" uses a standard SCVI Encoder plus DecoderSplice.
-        "partial" uses PartialEncoderEDDIFaster plus a linear splicing decoder.
+    splicing_encoder_architecture : {"vanilla","partial"}, default "vanilla"
+        Splicing encoder choice:
+        "vanilla" uses a standard SCVI Encoder.
+        "partial" uses PartialEncoderEDDIFaster.
+    splicing_decoder_architecture : {"vanilla","linear"}, default "vanilla"
+        Splicing decoder choice:
+        "vanilla" uses DecoderSplice (nonlinear).
+        "linear" uses a LinearDecoder.
     expression_architecture : {"vanilla","linear"}, default "vanilla"
-        Decoder for expression:
+        Expression decoder:
         "vanilla" uses a non linear DecoderSCVI.
         "linear" uses a LinearDecoderSCVI.
 
@@ -152,7 +157,7 @@ class SPLICEVAE(BaseModuleClass):
         Latent dimensionality. If None, defaults to roughly sqrt(n_hidden).
         When modality_weights="concatenate", the mixed latent is doubled internally.
     n_layers_encoder : int, default 2
-        Depth of SCVI encoders (expression branch and splicing branch when splicing_architecture="vanilla").
+        Depth of SCVI encoders (expression branch and splicing branch when splicing_encoder_architecture="vanilla").
         Also controls the depth of the post pooling MLP in the partial splicing encoder.
     n_layers_decoder : int, default 2
         Depth of non linear decoders (expression "vanilla", splicing "vanilla").
@@ -184,7 +189,7 @@ class SPLICEVAE(BaseModuleClass):
     dm_concentration : {"atse","scalar"}, default "atse"
         For Dirichlet multinomial. Controls whether the concentration is per ATSE or scalar.
 
-    # --- PartialEncoder knobs (splicing_architecture="partial") ---
+    # --- PartialEncoder knobs (splicing_encoder_architecture="partial") ---
     code_dim : int, default 16
         Dimensionality of per junction codes before pooling.
     h_hidden_dim : int, default 64
@@ -230,7 +235,8 @@ class SPLICEVAE(BaseModuleClass):
         use_size_factor_key: bool = False,
 
         # --- Architecture toggles ---
-        splicing_architecture: Literal["vanilla", "partial"] = "vanilla",
+        splicing_encoder_architecture: Literal["vanilla", "partial"] = "vanilla",
+        splicing_decoder_architecture: Literal["vanilla", "linear"] = "vanilla",
         expression_architecture: Literal["vanilla", "linear"] = "vanilla",
 
         # --- Shared SCVI-style encoder/decoder hyperparameters ---
@@ -250,7 +256,7 @@ class SPLICEVAE(BaseModuleClass):
         splicing_concentration: float | None = None,
         dm_concentration: Literal["atse", "scalar"] = "atse",
 
-        # --- PartialEncoder (splicing_architecture="partial") knobs ---
+        # --- PartialEncoder (splicing_encoder_architecture="partial") knobs ---
         code_dim: int = 16,
         h_hidden_dim: int = 64,
         encoder_hidden_dim: int = 128,
@@ -300,7 +306,8 @@ class SPLICEVAE(BaseModuleClass):
         # New splicing parameters
         self.splicing_loss_type = splicing_loss_type
         self.splicing_concentration = splicing_concentration
-        self.splicing_architecture = splicing_architecture
+        self.splicing_encoder_architecture = splicing_encoder_architecture
+        self.splicing_decoder_architecture = splicing_decoder_architecture
         self.code_dim = code_dim
         self.h_hidden_dim = h_hidden_dim
         self.dm_concentration = dm_concentration
@@ -388,7 +395,7 @@ class SPLICEVAE(BaseModuleClass):
             self.log_phi_j = nn.Parameter(torch.tensor(0.0))
             self.log_phi_j.requires_grad_(False)
 
-        if (splicing_architecture == "vanilla"):
+        if splicing_encoder_architecture == "vanilla":
             self.z_encoder_splicing = Encoder(
                 n_input=n_input_encoder_spl,
                 n_layers=n_layers_encoder,
@@ -402,17 +409,6 @@ class SPLICEVAE(BaseModuleClass):
                 use_batch_norm=self.use_batch_norm_encoder,
                 use_layer_norm=self.use_layer_norm_encoder,
                 return_dist=False,
-            )
-            self.z_decoder_splicing = DecoderSplice(
-                n_input=n_input_decoder,
-                n_output=n_input_junctions,
-                n_cat_list=cat_list,
-                n_layers=n_layers_decoder,
-                n_hidden=self.n_hidden,
-                dropout_rate=dropout_rate,
-                use_batch_norm=self.use_batch_norm_decoder,
-                use_layer_norm=self.use_layer_norm_decoder,
-                deep_inject_covariates=deeply_inject_covariates,
             )
         else:
             # Partial splicing encoder: PartialEncoderEDDIFaster only
@@ -436,24 +432,20 @@ class SPLICEVAE(BaseModuleClass):
             else:
                 self.z_encoder_splicing.z_transformation = lambda x: x
 
-            input_linear_splicing_decoder = self.n_latent
-
-            self.z_decoder_splicing = LinearDecoder(
-                latent_dim=input_linear_splicing_decoder,
-                output_dim=n_input_junctions,
+        if splicing_decoder_architecture == "vanilla":
+            self.z_decoder_splicing = DecoderSplice(
+                n_input=n_input_decoder,
+                n_output=n_input_junctions,
                 n_cat_list=cat_list,
-                n_cont=n_continuous_cov,
+                n_layers=n_layers_decoder,
+                n_hidden=self.n_hidden,
+                dropout_rate=dropout_rate,
+                use_batch_norm=self.use_batch_norm_decoder,
+                use_layer_norm=self.use_layer_norm_decoder,
+                deep_inject_covariates=deeply_inject_covariates,
             )
-
-                
-
-            if latent_distribution == "ln":
-                self.z_encoder_splicing.z_transformation = nn.Softmax(dim=-1)
-            else:
-                self.z_encoder_splicing.z_transformation = lambda x: x
-
+        else:
             input_linear_splicing_decoder = self.n_latent
-
             self.z_decoder_splicing = LinearDecoder(
                 latent_dim=input_linear_splicing_decoder,
                 output_dim=n_input_junctions,
@@ -543,7 +535,7 @@ class SPLICEVAE(BaseModuleClass):
         #     f"qzv_expr NaNs={torch.isnan(qzv_expr).sum().item()}"
         # )
 
-        if self.splicing_architecture == "vanilla":
+        if self.splicing_encoder_architecture == "vanilla":
             # your existing SCVI encoder
             qzm_spl, qzv_spl, z_spl = self.z_encoder_splicing(
                 encoder_input_spl, batch_index, *categorical_input
@@ -748,7 +740,7 @@ class SPLICEVAE(BaseModuleClass):
 
         decoder_input_expr = _attach_cont(dec_in_expr)
         # NOTE: partial splicing decoder expects cont covs via arg, not concatenated
-        decoder_input_spl  = _attach_cont(dec_in_spl) if self.splicing_architecture=="vanilla" else dec_in_spl
+        decoder_input_spl  = _attach_cont(dec_in_spl) if self.splicing_decoder_architecture == "vanilla" else dec_in_spl
         
 
         if torch.rand(1).item() < 0.01: 
@@ -756,7 +748,7 @@ class SPLICEVAE(BaseModuleClass):
             print(f"splicing input {decoder_input_spl}")
 
         # Splicing
-        if self.splicing_architecture == "vanilla":
+        if self.splicing_decoder_architecture == "vanilla":
             p_s = self.z_decoder_splicing(decoder_input_spl, batch_index, *categorical_input)
         else:
             p_s_logits = self.z_decoder_splicing(dec_in_spl, batch_index, *categorical_input, cont=cont_covs)
@@ -1183,6 +1175,3 @@ def sym_kld(qzm1, qzv1, qzm2, qzv2):
     rv2 = Normal(qzm2, qzv2.sqrt())
 
     return kld(rv1, rv2) + kld(rv2, rv1)
-
-
-

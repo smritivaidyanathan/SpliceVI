@@ -4,7 +4,8 @@
 #SBATCH --error=logs/splicevi_eval_%j.err
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --mem=230G
+#SBATCH --mem=300G
+#SBATCH --cpus-per-task=4
 #SBATCH --time=30:00:00
 
 set -euo pipefail
@@ -44,16 +45,16 @@ MODEL_DIR="/gpfs/commons/home/svaidyanathan/repos/SpliceVI/models/splicevi_basic
 # These must match argparse in eval_splicevi.py (nargs="+")
 EVALS=(
   umap
-  # clustering
-  # train_eval
-  # test_eval
-  # age_r2_heatmap
-  # masked_impute
+  clustering
+  train_eval
+  test_eval
+  age_r2_heatmap
+  masked_impute
 )
 
 # 4) UMAP and imputation config
 UMAP_TOP_N_CELLTYPES=15       # kept for compatibility (currently unused in plotting logic)
-IMPUTE_BATCH_SIZE=256         # set to -1 to disable batching (one big batch per masked file)
+IMPUTE_BATCH_SIZE=4096         # set to -1 to disable batching (one big batch per masked file)
 
 # List of obs keys to use for coloring TRAIN UMAPs for each latent space
 UMAP_OBS_KEYS=(

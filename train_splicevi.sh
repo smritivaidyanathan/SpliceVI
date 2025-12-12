@@ -5,6 +5,7 @@
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --mem=230G
+#SBATCH --cpus-per-task=4
 #SBATCH --time=24:00:00
 
 
@@ -36,6 +37,9 @@ MODEL_DIR_BASE="models"
 # Location of the training Python script (in your repo)
 SCRIPT_PATH="src/train_splicevi.py"
 
+# Batch column in obs; set to "None" to disable batch correction
+BATCH_KEY="None"
+
 # 2) Conda / environment
 CONDA_BASE="/gpfs/commons/home/svaidyanathan/miniconda3"
 ENV_NAME="splicevi-env"
@@ -45,7 +49,7 @@ MAX_EPOCHS=500          # Total training epochs
 LR=1e-5                 # Learning rate
 BATCH_SIZE=256          # Minibatch size
 N_EPOCHS_KL_WARMUP=100  # KL warmup epochs
-N_LATENT=10             # Latent dimensionality
+N_LATENT=30             # Latent dimensionality
 DROPOUT_RATE=0.01       # Model dropout rate
 SPLICING_LOSS_TYPE="dirichlet_multinomial"  # binomial | beta_binomial | dirichlet_multinomial
 
@@ -62,8 +66,9 @@ ENCODE_COVARIATES=false
 GENE_LIKELIHOOD="zinb"               # zinb | nb | poisson
 DISPERSION="gene"                    # gene | gene-batch | gene-label | gene-cell
 DM_CONCENTRATION="atse"              # atse | scalar
-SPLICING_ARCHITECTURE="partial"      # vanilla | partial
-EXPRESSION_ARCHITECTURE="linear"     # vanilla | linear
+SPLICING_ENCODER_ARCHITECTURE="partial"  # vanilla | partial
+SPLICING_DECODER_ARCHITECTURE="vanilla"   # vanilla | linear
+EXPRESSION_ARCHITECTURE="vanilla"         # vanilla | linear
 ENCODER_HIDDEN_DIM=128
 CODE_DIM=32
 H_HIDDEN_DIM=64
@@ -160,6 +165,7 @@ set -x
 python "${SCRIPT_PATH}" \
   --train_mdata_path "${TRAIN_MDATA_PATH}" \
   --model_dir "${MODEL_DIR}" \
+  --batch_key "${BATCH_KEY}" \
   --max_epochs "${MAX_EPOCHS}" \
   --lr "${LR}" \
   --batch_size "${BATCH_SIZE}" \
@@ -184,7 +190,8 @@ python "${SCRIPT_PATH}" \
   --h_hidden_dim "${H_HIDDEN_DIM}" \
   --pool_mode "${POOL_MODE}" \
   --max_nobs "${MAX_NOBS}" \
-  --splicing_architecture "${SPLICING_ARCHITECTURE}" \
+  --splicing_encoder_architecture "${SPLICING_ENCODER_ARCHITECTURE}" \
+  --splicing_decoder_architecture "${SPLICING_DECODER_ARCHITECTURE}" \
   --expression_architecture "${EXPRESSION_ARCHITECTURE}" \
   --initialize_embeddings_from_pca "${INITIALIZE_EMBEDDINGS_FROM_PCA}" \
   --fully_paired "${FULLY_PAIRED}" \
