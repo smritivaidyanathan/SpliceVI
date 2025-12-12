@@ -54,7 +54,7 @@ EVALS=(
 
 # 4) UMAP and imputation config
 UMAP_TOP_N_CELLTYPES=15       # kept for compatibility (currently unused in plotting logic)
-IMPUTE_BATCH_SIZE=4096         # set to -1 to disable batching (one big batch per masked file)
+IMPUTE_BATCH_SIZE=8192         # set to -1 to disable batching (one big batch per masked file)
 
 # List of obs keys to use for coloring TRAIN UMAPs for each latent space
 UMAP_OBS_KEYS=(

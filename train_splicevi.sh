@@ -38,7 +38,7 @@ MODEL_DIR_BASE="models"
 SCRIPT_PATH="src/train_splicevi.py"
 
 # Batch column in obs; set to "None" to disable batch correction
-BATCH_KEY="mouse.id"
+BATCH_KEY="None"
 
 # 2) Conda / environment
 CONDA_BASE="/gpfs/commons/home/svaidyanathan/miniconda3"
@@ -67,8 +67,8 @@ GENE_LIKELIHOOD="zinb"               # zinb | nb | poisson
 DISPERSION="gene"                    # gene | gene-batch | gene-label | gene-cell
 DM_CONCENTRATION="atse"              # atse | scalar
 SPLICING_ENCODER_ARCHITECTURE="partial"  # vanilla | partial
-SPLICING_DECODER_ARCHITECTURE="linear"   # vanilla | linear
-EXPRESSION_ARCHITECTURE="linear"         # vanilla | linear
+SPLICING_DECODER_ARCHITECTURE="vanilla"   # vanilla | linear
+EXPRESSION_ARCHITECTURE="vanilla"         # vanilla | linear
 ENCODER_HIDDEN_DIM=128
 CODE_DIM=32
 H_HIDDEN_DIM=64
