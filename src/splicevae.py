@@ -252,7 +252,7 @@ class SPLICEVAE(BaseModuleClass):
         encode_covariates: bool = False,
 
         # --- Splicing likelihood ---
-        splicing_loss_type: Literal["binomial", "beta_binomial", "dirichlet_multinomial"] = "beta_binomial",
+        splicing_loss_type: Literal["binomial", "beta_binomial", "dirichlet_multinomial"] = "dirichlet_multinomial",
         splicing_concentration: float | None = None,
         dm_concentration: Literal["atse", "scalar"] = "atse",
 

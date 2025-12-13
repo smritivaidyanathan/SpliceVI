@@ -33,33 +33,38 @@ TEST_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUS
 MAPPING_CSV="/gpfs/commons/home/svaidyanathan/repos/multivi_tools_splicing/multivi_splice_utils/runfiles/tissue_celltype_mapping.csv"
 
 # Optional masked TEST MuData paths for imputation
+# MASKED_TEST_MDATA_PATHS="\
+# /gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/MASKED_25_PERCENT_test_30_70_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu \
+# /gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/MASKED_50_PERCENT_test_30_70_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu \
+# /gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/MASKED_75_PERCENT_test_30_70_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu"
+
+
 MASKED_TEST_MDATA_PATHS="\
-/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/MASKED_25_PERCENT_test_30_70_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu \
-/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/MASKED_50_PERCENT_test_30_70_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu \
-/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/MASKED_75_PERCENT_test_30_70_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu"
+/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/MASKED_25_PERCENT_test_30_70_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu"
 
 # 2) Single model directory to evaluate
-MODEL_DIR="/gpfs/commons/home/svaidyanathan/repos/SpliceVI/models/splicevi_basic_20251201_212338/"
+MODEL_DIR="/gpfs/commons/home/svaidyanathan/repos/SpliceVI/models/splicevi_basic_20251212_020325/"
 
 # 3) Evaluation blocks to run
 # These must match argparse in eval_splicevi.py (nargs="+")
 EVALS=(
-  umap
-  clustering
-  train_eval
-  test_eval
-  age_r2_heatmap
+  # umap
+  # clustering
+  # train_eval
+  # test_eval
+  # age_r2_heatmap
   masked_impute
 )
 
 # 4) UMAP and imputation config
 UMAP_TOP_N_CELLTYPES=15       # kept for compatibility (currently unused in plotting logic)
-IMPUTE_BATCH_SIZE=8192         # set to -1 to disable batching (one big batch per masked file)
+IMPUTE_BATCH_SIZE=512         # set to -1 to disable batching (one big batch per masked file)
 
 # List of obs keys to use for coloring TRAIN UMAPs for each latent space
 UMAP_OBS_KEYS=(
   "broad_cell_type"
   "medium_cell_type"
+  "mouse.id"
   # "tissue"
   # "tissue_celltype"
 )

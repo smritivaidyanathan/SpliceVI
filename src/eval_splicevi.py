@@ -740,6 +740,28 @@ def main():
 
                 palette = color_dict if obs_key == "group_highlighted" else None
 
+                # Avoid Scanpy defaulting to a single gray color when there are many categories
+                # (e.g., lots of mouse IDs). Force a large distinct palette for high-cardinality keys.
+                if palette is None:
+                    obs_series = mdata_train["rna"].obs[obs_key]
+                    obs_as_str = obs_series.astype(str)
+                    n_categories = obs_as_str.nunique()
+                    normalized_key = obs_key.lower().replace(".", "_")
+                    needs_large_palette = normalized_key in {"mouse_id", "mouseid"} or n_categories > 100
+                    if needs_large_palette:
+                        # Preserve categorical ordering if present; otherwise sort for determinism
+                        if pd.api.types.is_categorical_dtype(obs_series):
+                            categories = list(obs_series.cat.categories.astype(str))
+                        else:
+                            categories = sorted(pd.Index(obs_as_str).unique())
+
+                        # Draw well-separated colors and shuffle them so adjacent labels differ
+                        cmap = cm.get_cmap("hsv", max(len(categories), 1))
+                        base_colors = cmap(np.linspace(0, 1, len(categories), endpoint=False))
+                        rng = np.random.default_rng(42)
+                        permuted = base_colors[rng.permutation(len(categories))]
+                        palette = {cat: permuted[i] for i, cat in enumerate(categories)}
+
                 sc.pl.embedding(
                     mdata_train["rna"],
                     basis=key_umap,

@@ -74,7 +74,7 @@ CODE_DIM=32
 H_HIDDEN_DIM=64
 POOL_MODE="mean"                     # mean | sum
 MAX_NOBS=-1                          # cap for scatter chunking (-1 disables)
-INITIALIZE_EMBEDDINGS_FROM_PCA=false
+INITIALIZE_EMBEDDINGS_FROM_PCA=true
 FULLY_PAIRED=false
 
 WEIGHT_DECAY=1e-3
