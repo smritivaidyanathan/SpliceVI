@@ -188,16 +188,26 @@ import pandas as pd
 TEST_SIZE    = 0.30
 RANDOM_STATE = 42
 
-# 1) Make age_group (fixed cutoffs). If age_numeric is in months, use (mdata.obs["age_numeric"]/12)
-years = mdata.obs["age_numeric"].astype("Float64")
-mdata.obs["age_group"] = pd.cut(
-    years, bins=[0, 35, 65, np.inf], labels=["young", "medium", "old"],
-    include_lowest=True, right=False
-)
+# 1) Decide whether to bin into age_group (only if there are >3 distinct ages)
+age_numeric = mdata.obs["age_numeric"].astype("Float64")
+unique_age_count = age_numeric.dropna().nunique()
+
+if unique_age_count > 10: #this if block is for human data (too many ages to stratify on age, so we split into three groups)
+    print("Appears to be human data...stratifying based on young, medium, and old.")
+    years = age_numeric
+    mdata.obs["age_group"] = pd.cut(
+        years, bins=[0, 35, 65, np.inf], labels=["young", "medium", "old"],
+        include_lowest=True, right=False
+    )
+    age_label = mdata.obs["age_group"].astype("string").fillna("NA")
+else:
+    # Use the numeric age directly for stratification when few distinct ages
+    mdata.obs["age_group"] = pd.NA
+    age_label = age_numeric.astype("Int64").astype("string").fillna("NA")
 
 # 2) Build combined strata and collapse rare ones
 ct   = mdata.obs["broad_cell_type"].astype("string").fillna("NA")
-ageg = mdata.obs["age_group"].astype("string").fillna("NA")
+ageg = age_label
 combo = (ct + "|" + ageg).astype("string")
 
 counts = combo.value_counts()
