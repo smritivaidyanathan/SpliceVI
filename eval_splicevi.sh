@@ -26,8 +26,8 @@ set -euo pipefail
 #######################################
 
 # 1) Data paths
-TRAIN_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/train_70_30_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu"
-TEST_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/test_30_70_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu"
+TRAIN_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/train_70_30_model_ready_combined_gene_expression_aligned_splicing_20251009_024406_UPDATEDOBS.h5mu"
+TEST_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/test_30_70_model_ready_combined_gene_expression_aligned_splicing_20251009_024406_UPDATEDOBS.h5mu"
 
 # Optional mapping CSV (can be empty if not used)
 MAPPING_CSV="/gpfs/commons/home/svaidyanathan/repos/multivi_tools_splicing/multivi_splice_utils/runfiles/tissue_celltype_mapping.csv"
@@ -40,19 +40,27 @@ MAPPING_CSV="/gpfs/commons/home/svaidyanathan/repos/multivi_tools_splicing/multi
 
 
 MASKED_TEST_MDATA_PATHS="\
-/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/MASKED_25_PERCENT_test_30_70_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu"
+/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/MASKED_25_PERCENT_test_30_70_model_ready_combined_gene_expression_aligned_splicing_20251009_024406_UPDATEDOBS.h5mu"
 
 # 2) Single model directory to evaluate
-MODEL_DIR="/gpfs/commons/home/svaidyanathan/repos/SpliceVI/models/splicevi_basic_20251212_020325/"
+# MODEL_DIR="/gpfs/commons/home/svaidyanathan/repos/SpliceVI/models/splicevi_basic_20260127_143801"  #non linear (yes batch key)
+
+MODEL_DIR="/gpfs/commons/home/svaidyanathan/repos/SpliceVI/models/splicevi_basic_20251213_111454"  #linear (yes batch key)
+
+# MODEL_DIR="/gpfs/commons/home/svaidyanathan/repos/SpliceVI/models/splicevi_basic_20260121_123415" #linear (no batch key)
+
+
+
 
 # 3) Evaluation blocks to run
 # These must match argparse in eval_splicevi.py (nargs="+")
 EVALS=(
-  # umap
+  umap
   # clustering
   # train_eval
   # test_eval
-  # age_r2_heatmap
+  cross_fold_classification
+  age_r2_heatmap
   masked_impute
 )
 
@@ -65,8 +73,22 @@ UMAP_OBS_KEYS=(
   "broad_cell_type"
   "medium_cell_type"
   "mouse.id"
+  "tissue_celltype"
   # "tissue"
   # "tissue_celltype"
+)
+
+# 4.5) Cross-fold classification config
+CROSS_FOLD_SPLITS="train"  # train | test | both
+CROSS_FOLD_TARGETS=(
+  "broad_cell_type"
+  "mouse.id"
+  "tissue_celltype"
+)
+CROSS_FOLD_K=5
+CROSS_FOLD_CLASSIFIERS=(
+  "logreg"
+  # "rf"
 )
 
 # 5) Conda / script locations
@@ -116,6 +138,16 @@ echo "[JOB] UMAP_OBS_KEYS:"
 for k in "${UMAP_OBS_KEYS[@]}"; do
   echo "         - ${k}"
 done
+echo "[JOB] CROSS_FOLD_SPLITS : ${CROSS_FOLD_SPLITS}"
+echo "[JOB] CROSS_FOLD_TARGETS:"
+for t in "${CROSS_FOLD_TARGETS[@]}"; do
+  echo "         - ${t}"
+done
+echo "[JOB] CROSS_FOLD_CLASSIFIERS:"
+for c in "${CROSS_FOLD_CLASSIFIERS[@]}"; do
+  echo "         - ${c}"
+done
+echo "[JOB] CROSS_FOLD_K      : ${CROSS_FOLD_K}"
 echo "=================================================================="
 
 #######################################
@@ -163,6 +195,8 @@ echo
 
 EVALS_JOINED="${EVALS[*]}"
 UMAP_OBS_KEYS_JOINED="${UMAP_OBS_KEYS[*]}"
+CROSS_FOLD_TARGETS_JOINED="${CROSS_FOLD_TARGETS[*]}"
+CROSS_FOLD_CLASSIFIERS_JOINED="${CROSS_FOLD_CLASSIFIERS[*]}"
 
 #######################################
 # LAUNCH EVALUATION
@@ -180,6 +214,10 @@ python "${SCRIPT_PATH}" \
   --impute_batch_size "${IMPUTE_BATCH_SIZE}" \
   --umap_top_n_celltypes "${UMAP_TOP_N_CELLTYPES}" \
   --umap_obs_keys ${UMAP_OBS_KEYS_JOINED} \
+  --cross_fold_splits "${CROSS_FOLD_SPLITS}" \
+  --cross_fold_targets ${CROSS_FOLD_TARGETS_JOINED} \
+  --cross_fold_k "${CROSS_FOLD_K}" \
+  --cross_fold_classifiers ${CROSS_FOLD_CLASSIFIERS_JOINED} \
   --evals ${EVALS_JOINED} \
   ${MASKED_TEST_MDATA_PATHS:+--masked_test_mdata_paths ${MASKED_TEST_MDATA_PATHS}} \
   ${WANDB_ARGS}

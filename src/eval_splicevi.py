@@ -35,8 +35,10 @@ import matplotlib.cm as cm
 import seaborn as sns
 
 from sklearn.decomposition import PCA
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.linear_model import LogisticRegression, RidgeCV
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.pipeline import make_pipeline
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -47,7 +49,7 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import StandardScaler
 from scipy import sparse
-from scipy.stats import spearmanr
+from scipy.stats import spearmanr, ttest_rel
 
 from tqdm.auto import tqdm
 
@@ -187,6 +189,8 @@ def apply_obs_mapping_from_csv(mdata, mapping_csv: str):
 # Evaluation helper: train/test split metrics
 # ---------------------------------------------------------------------
 AGE_R2_RECORDS = []
+CROSS_FOLD_RECORDS = []
+CROSS_FOLD_SIGNIFICANCE = []
 MIN_GROUP_N = 25  # minimum cells per tissue | celltype group
 
 
@@ -198,6 +202,7 @@ def evaluate_split(
     cell_type_classification_key: str,
     Z_type: str = "joint",
     wandb=None,
+    precomputed_Z: Optional[np.ndarray] = None,
 ):
     """
     Latent-quality evaluation for TRAIN / TEST splits:
@@ -207,7 +212,10 @@ def evaluate_split(
       - Age R² overall + per tissue|celltype group
     """
     print(f"\n=== [EVAL] Evaluating {name.upper()} split for latent space '{Z_type}' ===")
-    Z = model.get_latent_representation(adata=mdata, modality=Z_type)
+    if precomputed_Z is not None:
+        Z = precomputed_Z
+    else:
+        Z = model.get_latent_representation(adata=mdata, modality=Z_type)
     print(f"[EVAL/{name}-{Z_type}] Latent shape: {Z.shape}")
 
     # PCA 90% variance
@@ -371,6 +379,210 @@ def evaluate_split(
         print(f"[EVAL/{name}-{Z_type}] No 'age_numeric' column found; skipping age R².")
 
 
+def run_cross_fold_classification(
+    split_name: str,
+    mdata,
+    latent_spaces: Dict[str, np.ndarray],
+    targets: List[str],
+    k_folds: int,
+    classifiers: List[str],
+    fig_dir: str,
+    wandb=None,
+):
+    """
+    K-fold classification for multiple obs targets across latent spaces.
+
+    Evaluates Logistic Regression and/or Random Forest across joint/expression/splicing
+    embeddings using shared StratifiedKFold splits, logs mean±std metrics, and records
+    paired t-test p-values between spaces.
+    """
+    print(f"\n=== [CROSS-FOLD] Starting {split_name.upper()} cross-fold classification ===")
+    spaces_order = ["joint", "expression", "splicing"]
+    available_spaces = [s for s in spaces_order if s in latent_spaces]
+    if len(available_spaces) == 0:
+        print("[CROSS-FOLD] No latent spaces provided; skipping.")
+        return
+
+    metric_fns = {
+        "accuracy": accuracy_score,
+        "f1_weighted": lambda yt, yp: f1_score(
+            yt, yp, average="weighted", zero_division=0
+        ),
+    }
+
+    def build_classifier(name: str):  # build either Random Forest or Logistic Regression
+        if name == "logreg":
+            lr_kwargs = dict(
+                max_iter=2000,
+                n_jobs=-1,
+                class_weight="balanced",
+                solver="lbfgs",
+            )
+            # Some older sklearn builds (or alternative backends) do not accept multi_class.
+            try:
+                logreg = LogisticRegression(multi_class="auto", **lr_kwargs)
+            except TypeError:
+                logreg = LogisticRegression(**lr_kwargs)
+            return make_pipeline(StandardScaler(), logreg)
+        if name == "rf":
+            return RandomForestClassifier(
+                n_estimators=300,
+                n_jobs=-1,
+                random_state=42,
+                class_weight="balanced_subsample",
+            )
+        raise ValueError(f"Unsupported classifier '{name}'.")
+
+    for target in targets:
+        if target not in mdata.obs.columns:
+            print(f"[CROSS-FOLD] Target '{target}' missing in obs; skipping.")
+            continue
+
+        labels_series_full = mdata.obs[target].astype("string").fillna("NA")
+        total_n_samples = int(labels_series_full.size)
+        labels_series = labels_series_full
+        keep_indices = np.arange(total_n_samples)
+
+        # Optionally drop singleton mice so StratifiedKFold has support.
+        if target == "mouse.id":
+            counts = labels_series_full.value_counts()
+            singleton_labels = counts[counts == 1].index
+            if len(singleton_labels) > 0:
+                mask_keep = ~labels_series_full.isin(singleton_labels)
+                removed = int((~mask_keep).sum())
+                labels_series = labels_series_full[mask_keep]
+                keep_indices = np.flatnonzero(mask_keep.to_numpy())
+                print(
+                    f"[CROSS-FOLD] Target '{target}' | filtering {removed} singleton mice for CV."
+                )
+            else:
+                print(
+                    f"[CROSS-FOLD] Target '{target}' | no singleton mice to filter for CV."
+                )
+
+        y = labels_series.to_numpy()
+        n_samples = int(y.size)
+        n_classes = int(labels_series.nunique())
+        if n_classes < 2:
+            print(
+                f"[CROSS-FOLD] Target '{target}' has <2 classes ({n_classes}); skipping."
+            )
+            continue
+
+        min_count = int(labels_series.value_counts().min()) #this is important to make sure we don't have more folds than the smaller num labels in our specificied obs fields
+        k_use = min(k_folds, min_count)
+        if k_use < 2:
+            print(
+                f"[CROSS-FOLD] Target '{target}' lacks support for 2-fold CV (min class count={min_count}); skipping."
+            )
+            continue
+
+        print(
+            f"[CROSS-FOLD] Target '{target}' | classes={n_classes}, n={n_samples}, folds={k_use}"
+        )
+
+        skf = StratifiedKFold(n_splits=k_use, shuffle=True, random_state=42)
+        splits = list(skf.split(np.zeros(n_samples), y)) #stratified k fold on the specified obs target
+
+        # (classifier, metric, space) -> list of fold scores
+        fold_scores: Dict[Tuple[str, str, str], List[float]] = {}
+
+        for space_name in available_spaces:
+            Z_full = latent_spaces[space_name]
+            if Z_full.shape[0] != total_n_samples:
+                print(
+                    f"[CROSS-FOLD] Latent '{space_name}' has {Z_full.shape[0]} rows but expected {total_n_samples}; skipping this space."
+                )
+                continue
+            Z = Z_full[keep_indices]
+
+            for clf_name in classifiers:
+                for fold_idx, (tr_idx, ev_idx) in enumerate(splits):
+                    clf_fit = build_classifier(clf_name)
+                    clf_fit.fit(Z[tr_idx], y[tr_idx])
+                    y_pred = clf_fit.predict(Z[ev_idx])
+                    for metric_name, metric_fn in metric_fns.items():
+                        score = float(metric_fn(y[ev_idx], y_pred))
+                        fold_scores.setdefault(
+                            (clf_name, metric_name, space_name), []
+                        ).append(score)
+
+        # Summaries + logging
+        for (clf_name, metric_name, space_name), scores in fold_scores.items():
+            mean_score = float(np.mean(scores))
+            std_score = float(np.std(scores, ddof=1)) if len(scores) > 1 else 0.0
+            CROSS_FOLD_RECORDS.append(
+                {
+                    "split": split_name,
+                    "target": target,
+                    "classifier": clf_name,
+                    "space": space_name,
+                    "metric": metric_name,
+                    "mean": mean_score,
+                    "std": std_score,
+                    "n_folds": len(scores),
+                    "n_samples": n_samples,
+                    "n_classes": n_classes,
+                }
+            )
+            print(
+                f"[CROSS-FOLD] {split_name} | {target} | {clf_name} | {space_name} | "
+                f"{metric_name}: {mean_score:.4f} ± {std_score:.4f} (n={len(scores)})"
+            )
+            if wandb is not None:
+                wandb.log(
+                    {
+                        f"crossfold/{split_name}/{target}/{clf_name}/{space_name}/{metric_name}_mean": mean_score,
+                        f"crossfold/{split_name}/{target}/{clf_name}/{space_name}/{metric_name}_std": std_score,
+                    }
+                )
+                score_id = 0
+                for score in scores:
+                    wandb.log({f"crossfold/{split_name}/{target}/{clf_name}/{space_name}/{metric_name}_fold{score_id}": score})
+                    score_id+=1
+
+
+            
+
+        # Significance: paired t-tests between spaces for each classifier/metric
+        for clf_name in classifiers:
+            for metric_name in metric_fns.keys():
+                for i in range(len(available_spaces)):
+                    for j in range(i + 1, len(available_spaces)):
+                        a = available_spaces[i]
+                        b = available_spaces[j]
+                        key_a = (clf_name, metric_name, a)
+                        key_b = (clf_name, metric_name, b)
+                        if key_a not in fold_scores or key_b not in fold_scores:
+                            continue
+                        scores_a = np.array(fold_scores[key_a], dtype=float)
+                        scores_b = np.array(fold_scores[key_b], dtype=float)
+                        if scores_a.size < 2 or scores_b.size < 2:
+                            pval = np.nan
+                            mean_diff = np.nan
+                        else:
+                            stat, pval = ttest_rel(scores_a, scores_b)
+                            mean_diff = float(scores_a.mean() - scores_b.mean())
+
+                        CROSS_FOLD_SIGNIFICANCE.append(
+                            {
+                                "split": split_name,
+                                "target": target,
+                                "classifier": clf_name,
+                                "metric": metric_name,
+                                "space_a": a,
+                                "space_b": b,
+                                "pvalue": float(pval) if pval is not None else np.nan,
+                                "mean_diff_a_minus_b": mean_diff,
+                                "n_folds": int(min(scores_a.size, scores_b.size)),
+                            }
+                        )
+                        print(
+                            f"[CROSS-FOLD] Significance {split_name} | {target} | {clf_name} | {metric_name} : "
+                            f"{a} vs {b} p={pval:.4e} (diff={mean_diff:.4f})"
+                        )
+
+
 # ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
@@ -468,8 +680,38 @@ def build_argparser():
         ],
         help=(
             "Which eval blocks to run. Choices among: "
-            "umap, clustering, train_eval, test_eval, age_r2_heatmap, masked_impute"
+            "umap, clustering, train_eval, test_eval, age_r2_heatmap, masked_impute, cross_fold_classification"
         ),
+    )
+
+    # Cross-fold classification settings
+    parser.add_argument(
+        "--cross_fold_targets",
+        nargs="+",
+        default=["broad_cell_type", "batch"],
+        help=(
+            "List of .obs fields to classify in cross-fold evaluation (e.g., batch, broad_cell_type). "
+            "Missing fields are skipped."
+        ),
+    )
+    parser.add_argument(
+        "--cross_fold_splits",
+        choices=["train", "test", "both"],
+        default="train",
+        help="Run cross-fold classification on TRAIN, TEST, or both splits.",
+    )
+    parser.add_argument(
+        "--cross_fold_k",
+        type=int,
+        default=5,
+        help="Number of StratifiedKFold splits for cross-fold classification.",
+    )
+    parser.add_argument(
+        "--cross_fold_classifiers",
+        nargs="+",
+        choices=["logreg", "rf"],
+        default=["logreg", "rf"],
+        help="Classifiers to use for cross-fold evaluation (logreg=Logistic Regression, rf=Random Forest).",
     )
 
     # Optional W&B integration
@@ -516,6 +758,11 @@ def main():
     parser = build_argparser()
     args = parser.parse_args()
     EVALS = set(args.evals)
+    cross_fold_targets = list(dict.fromkeys(args.cross_fold_targets))
+    cross_fold_splits = args.cross_fold_splits
+    cross_fold_classifiers = args.cross_fold_classifiers
+    run_crossfold_train = cross_fold_splits in {"train", "both"}
+    run_crossfold_test = cross_fold_splits in {"test", "both"}
 
     os.makedirs(args.fig_dir, exist_ok=True)
 
@@ -542,6 +789,10 @@ def main():
         "evals": list(EVALS),
         "umap_top_n_celltypes": args.umap_top_n_celltypes,
         "umap_obs_keys": args.umap_obs_keys,
+        "cross_fold_targets": cross_fold_targets,
+        "cross_fold_splits": cross_fold_splits,
+        "cross_fold_k": args.cross_fold_k,
+        "cross_fold_classifiers": cross_fold_classifiers,
     }
 
     if args.use_wandb:
@@ -1126,6 +1377,7 @@ def main():
             cell_type_classification_key,
             Z_type="joint",
             wandb=wandb if run is not None else None,
+            precomputed_Z=latent_spaces_train.get("joint"),
         )
         evaluate_split(
             "train",
@@ -1135,6 +1387,7 @@ def main():
             cell_type_classification_key,
             Z_type="expression",
             wandb=wandb if run is not None else None,
+            precomputed_Z=latent_spaces_train.get("expression"),
         )
         evaluate_split(
             "train",
@@ -1144,9 +1397,25 @@ def main():
             cell_type_classification_key,
             Z_type="splicing",
             wandb=wandb if run is not None else None,
+            precomputed_Z=latent_spaces_train.get("splicing"),
         )
     else:
         print("[EVAL/TRAIN] Train-split evaluation skipped by config.")
+
+    # Cross-fold classification on TRAIN
+    if "cross_fold_classification" in EVALS and run_crossfold_train:
+        run_cross_fold_classification(
+            "train",
+            mdata_train,
+            latent_spaces_train,
+            cross_fold_targets,
+            args.cross_fold_k,
+            cross_fold_classifiers,
+            args.fig_dir,
+            wandb=wandb if run is not None else None,
+        )
+    elif "cross_fold_classification" in EVALS:
+        print("[CROSS-FOLD] TRAIN split disabled by --cross_fold_splits.")
 
     # Free TRAIN data
     print("[CLEANUP] Releasing TRAIN MuData from memory...")
@@ -1181,6 +1450,25 @@ def main():
         modalities={"rna_layer": "rna", "junc_ratio_layer": "splicing"},
     )
 
+    latent_spaces_test = {}
+    if ("test_eval" in EVALS) or (
+        "cross_fold_classification" in EVALS and run_crossfold_test
+    ):
+        print("[MODEL] Computing latent representations on TEST for evaluation...")
+        latent_spaces_test = {
+            "joint": model.get_latent_representation(adata=mdata_test),
+            "expression": model.get_latent_representation(
+                adata=mdata_test, modality="expression"
+            ),
+            "splicing": model.get_latent_representation(
+                adata=mdata_test, modality="splicing"
+            ),
+        }
+        for name, Z in latent_spaces_test.items():
+            print(f"[MODEL] TEST latent '{name}' shape: {Z.shape}")
+    else:
+        print("[MODEL] Skipping TEST latent computation (not requested).")
+
     if "test_eval" in EVALS:
         print("[EVAL/TEST] Starting test-split latent quality evaluation...")
         evaluate_split(
@@ -1191,6 +1479,7 @@ def main():
             cell_type_classification_key,
             Z_type="joint",
             wandb=wandb if run is not None else None,
+            precomputed_Z=latent_spaces_test.get("joint"),
         )
         evaluate_split(
             "test",
@@ -1200,6 +1489,7 @@ def main():
             cell_type_classification_key,
             Z_type="expression",
             wandb=wandb if run is not None else None,
+            precomputed_Z=latent_spaces_test.get("expression"),
         )
         evaluate_split(
             "test",
@@ -1209,9 +1499,50 @@ def main():
             cell_type_classification_key,
             Z_type="splicing",
             wandb=wandb if run is not None else None,
+            precomputed_Z=latent_spaces_test.get("splicing"),
         )
     else:
         print("[EVAL/TEST] Test-split evaluation skipped by config.")
+
+    # Cross-fold classification on TEST
+    if "cross_fold_classification" in EVALS and run_crossfold_test:
+        run_cross_fold_classification(
+            "test",
+            mdata_test,
+            latent_spaces_test,
+            cross_fold_targets,
+            args.cross_fold_k,
+            cross_fold_classifiers,
+            args.fig_dir,
+            wandb=wandb if run is not None else None,
+        )
+    elif "cross_fold_classification" in EVALS:
+        print("[CROSS-FOLD] TEST split disabled by --cross_fold_splits.")
+
+    # Cross-fold CSV dump
+    if "cross_fold_classification" in EVALS and len(CROSS_FOLD_RECORDS) > 0:
+        cross_df = pd.DataFrame(CROSS_FOLD_RECORDS)
+        cross_csv = os.path.join(args.fig_dir, "cross_fold_classification_results.csv")
+        cross_df.to_csv(cross_csv, index=False)
+        print(
+            f"[CROSS-FOLD] Wrote aggregated cross-fold metrics to {cross_csv} ({cross_df.shape[0]} rows)."
+        )
+        if run is not None:
+            wandb.log({"crossfold/results_csv_path": cross_csv})
+
+        if len(CROSS_FOLD_SIGNIFICANCE) > 0:
+            sig_df = pd.DataFrame(CROSS_FOLD_SIGNIFICANCE)
+            sig_csv = os.path.join(
+                args.fig_dir, "cross_fold_classification_significance.csv"
+            )
+            sig_df.to_csv(sig_csv, index=False)
+            print(
+                f"[CROSS-FOLD] Wrote paired t-test results to {sig_csv} ({sig_df.shape[0]} rows)."
+            )
+            if run is not None:
+                wandb.log({"crossfold/significance_csv_path": sig_csv})
+    elif "cross_fold_classification" in EVALS:
+        print("[CROSS-FOLD] No cross-fold records collected; no CSV written.")
 
     # Age R² CSV dump
     if "age_r2_heatmap" in EVALS:
