@@ -29,7 +29,14 @@ set -euo pipefail
 #######################################
 
 # 1) Paths
-TRAIN_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/train_70_30_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu"
+# TRAIN_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/train_70_30_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu"
+# TRAIN_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/train_70_30_model_ready_combined_gene_expression_aligned_splicing_20251009_024406_UPDATEDOBS_SUBSAMPLED_N_50000_SUBSAMPLED_N_25000_SUBSAMPLED_N_10000.h5mu"
+# TRAIN_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/train_70_30_model_ready_combined_gene_expression_aligned_splicing_20251009_024406_UPDATEDOBS_SUBSAMPLED_N_50000_SUBSAMPLED_N_25000.h5mu"
+# TRAIN_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/train_70_30_model_ready_combined_gene_expression_aligned_splicing_20251009_024406_UPDATEDOBS_SUBSAMPLED_N_50000.h5mu"
+# TRAIN_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/MASKED_25_PERCENT_train_70_30_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu"
+# TRAIN_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/MASKED_25_PERCENT_train_70_30_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu"
+# TRAIN_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/MASKED_50_PERCENT_train_70_30_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu"
+# TRAIN_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/MASKED_75_PERCENT_train_70_30_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu"
 
 # Base directory where trained models will be stored
 MODEL_DIR_BASE="models"
@@ -38,7 +45,7 @@ MODEL_DIR_BASE="models"
 SCRIPT_PATH="src/train_splicevi.py"
 
 # Batch column in obs; set to "None" to disable batch correction
-BATCH_KEY="None"
+BATCH_KEY="mouse.id"
 
 # 2) Conda / environment
 CONDA_BASE="/gpfs/commons/home/svaidyanathan/miniconda3"

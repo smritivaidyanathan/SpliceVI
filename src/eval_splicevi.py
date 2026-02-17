@@ -191,6 +191,7 @@ def apply_obs_mapping_from_csv(mdata, mapping_csv: str):
 AGE_R2_RECORDS = []
 CROSS_FOLD_RECORDS = []
 CROSS_FOLD_SIGNIFICANCE = []
+CROSS_FOLD_CLASS_RECORDS = []
 MIN_GROUP_N = 25  # minimum cells per tissue | celltype group
 
 
@@ -386,6 +387,7 @@ def run_cross_fold_classification(
     targets: List[str],
     k_folds: int,
     classifiers: List[str],
+    metrics: List[str],
     fig_dir: str,
     wandb=None,
 ):
@@ -395,6 +397,12 @@ def run_cross_fold_classification(
     Evaluates Logistic Regression and/or Random Forest across joint/expression/splicing
     embeddings using shared StratifiedKFold splits, logs mean±std metrics, and records
     paired t-test p-values between spaces.
+
+    Weighted f1:         ``'weighted'``:
+            Calculate metrics for each label, and find their average weighted
+            by support (the number of true instances for each label). This
+            alters 'macro' to account for label imbalance; it can result in an
+            F-score that is not between precision and recall.
     """
     print(f"\n=== [CROSS-FOLD] Starting {split_name.upper()} cross-fold classification ===")
     spaces_order = ["joint", "expression", "splicing"]
@@ -403,12 +411,27 @@ def run_cross_fold_classification(
         print("[CROSS-FOLD] No latent spaces provided; skipping.")
         return
 
-    metric_fns = {
-        "accuracy": accuracy_score,
-        "f1_weighted": lambda yt, yp: f1_score(
-            yt, yp, average="weighted", zero_division=0
-        ),
-    }
+    metric_fns = {}
+    for name in metrics:
+        if name == "accuracy":
+            metric_fns[name] = accuracy_score
+        elif name == "f1_weighted":
+            metric_fns[name] = lambda yt, yp: f1_score(
+                yt, yp, average="weighted", zero_division=0
+            )
+        elif name == "precision_weighted":
+            metric_fns[name] = lambda yt, yp: precision_score(
+                yt, yp, average="weighted", zero_division=0
+            )
+        elif name == "recall_weighted":
+            metric_fns[name] = lambda yt, yp: recall_score(
+                yt, yp, average="weighted", zero_division=0
+            )
+        else:
+            print(f"[CROSS-FOLD] Unknown metric '{name}' requested; skipping it.")
+    if len(metric_fns) == 0:
+        print("[CROSS-FOLD] No valid metrics provided; skipping cross-fold.")
+        return
 
     def build_classifier(name: str):  # build either Random Forest or Logistic Regression
         if name == "logreg":
@@ -460,31 +483,44 @@ def run_cross_fold_classification(
                     f"[CROSS-FOLD] Target '{target}' | no singleton mice to filter for CV."
                 )
 
+        # Drop classes with fewer than k_folds samples (cross-fold only)
+        class_counts = labels_series.value_counts()
+        drop_labels = class_counts[class_counts < k_folds].index
+        if len(drop_labels) > 0:
+            mask_keep = ~labels_series.isin(drop_labels)
+            labels_series = labels_series[mask_keep]
+            keep_indices = keep_indices[mask_keep.to_numpy()]
+            print(
+                f"[CROSS-FOLD] Target '{target}' | removing {len(drop_labels)} classes with <{k_folds} samples: {list(drop_labels)}"
+            )
+
+        label_order = sorted(labels_series.unique())
         y = labels_series.to_numpy()
         n_samples = int(y.size)
         n_classes = int(labels_series.nunique())
         if n_classes < 2:
             print(
-                f"[CROSS-FOLD] Target '{target}' has <2 classes ({n_classes}); skipping."
+                f"[CROSS-FOLD] Target '{target}' has <2 classes ({n_classes}) after filtering; skipping."
             )
             continue
 
-        min_count = int(labels_series.value_counts().min()) #this is important to make sure we don't have more folds than the smaller num labels in our specificied obs fields
-        k_use = min(k_folds, min_count)
-        if k_use < 2:
+        min_count = int(labels_series.value_counts().min())
+        if min_count < k_folds:
             print(
-                f"[CROSS-FOLD] Target '{target}' lacks support for 2-fold CV (min class count={min_count}); skipping."
+                f"[CROSS-FOLD] Target '{target}' still has a class with {min_count} samples (< k={k_folds}); skipping."
             )
             continue
+        k_use = k_folds
 
         print(
             f"[CROSS-FOLD] Target '{target}' | classes={n_classes}, n={n_samples}, folds={k_use}"
         )
 
+        # build stratified splits with the requested number of folds
         skf = StratifiedKFold(n_splits=k_use, shuffle=True, random_state=42)
-        splits = list(skf.split(np.zeros(n_samples), y)) #stratified k fold on the specified obs target
+        splits = list(skf.split(np.zeros(n_samples), y))  # stratified k-fold on target labels
 
-        # (classifier, metric, space) -> list of fold scores
+        # accumulate scores keyed by (classifier, metric, latent_space)
         fold_scores: Dict[Tuple[str, str, str], List[float]] = {}
 
         for space_name in available_spaces:
@@ -497,15 +533,60 @@ def run_cross_fold_classification(
             Z = Z_full[keep_indices]
 
             for clf_name in classifiers:
+                # loop over each fold's train/validation indices
                 for fold_idx, (tr_idx, ev_idx) in enumerate(splits):
+                    # build a fresh classifier instance per fold
                     clf_fit = build_classifier(clf_name)
+                    # fit on the training fold features/labels
                     clf_fit.fit(Z[tr_idx], y[tr_idx])
+                    # predict labels for the held-out fold
                     y_pred = clf_fit.predict(Z[ev_idx])
+                    # true labels for the held-out fold
+                    y_true = y[ev_idx]
                     for metric_name, metric_fn in metric_fns.items():
-                        score = float(metric_fn(y[ev_idx], y_pred))
+                        score = float(metric_fn(y_true, y_pred))
                         fold_scores.setdefault(
                             (clf_name, metric_name, space_name), []
                         ).append(score)
+
+                        # Per-class metrics for this fold
+                        if metric_name == "f1_weighted":
+                            per_class_scores = f1_score(
+                                y_true, y_pred, average=None, labels=label_order, zero_division=0
+                            )
+                        elif metric_name == "precision_weighted":
+                            per_class_scores = precision_score(
+                                y_true, y_pred, average=None, labels=label_order, zero_division=0
+                            )
+                        elif metric_name == "recall_weighted":
+                            per_class_scores = recall_score(
+                                y_true, y_pred, average=None, labels=label_order, zero_division=0
+                            )
+                        else:  # accuracy
+                            per_class_scores = []
+                            for lbl in label_order:
+                                mask = y_true == lbl
+                                if mask.any():
+                                    per_class_scores.append(
+                                        float((y_pred[mask] == lbl).mean())
+                                    )
+                                else:
+                                    per_class_scores.append(np.nan)
+
+                        for lbl, cls_score in zip(label_order, per_class_scores):
+                            CROSS_FOLD_CLASS_RECORDS.append(
+                                {
+                                    "split": split_name,
+                                    "target": target,
+                                    "classifier": clf_name,
+                                    "space": space_name,
+                                    "metric": metric_name,
+                                    "fold": int(fold_idx),
+                                    "obs_category": lbl,
+                                    "value": float(cls_score) if not np.isnan(cls_score) else np.nan,
+                                    "n_eval_for_class": int((y_true == lbl).sum()),
+                                }
+                            )
 
         # Summaries + logging
         for (clf_name, metric_name, space_name), scores in fold_scores.items():
@@ -634,6 +715,12 @@ def build_argparser():
         default=None,
         help="Optional: path to tissue/cell-type mapping CSV to overwrite obs fields.",
     )
+    parser.add_argument(
+        "--batch_key",
+        type=str,
+        default="None",
+        help="Optional obs column used as batch_key in setup_mudata. Use 'None' to disable.",
+    )
 
     # Imputation batch size: -1 means "no batching" (single batch of all cells)
     parser.add_argument(
@@ -713,6 +800,13 @@ def build_argparser():
         default=["logreg", "rf"],
         help="Classifiers to use for cross-fold evaluation (logreg=Logistic Regression, rf=Random Forest).",
     )
+    parser.add_argument(
+        "--cross_fold_metrics",
+        nargs="+",
+        choices=["accuracy", "f1_weighted", "precision_weighted", "recall_weighted"],
+        default=["accuracy", "f1_weighted", "precision_weighted", "recall_weighted"],
+        help="Metrics to report for cross-fold evaluation.",
+    )
 
     # Optional W&B integration
     parser.add_argument(
@@ -763,6 +857,7 @@ def main():
     cross_fold_classifiers = args.cross_fold_classifiers
     run_crossfold_train = cross_fold_splits in {"train", "both"}
     run_crossfold_test = cross_fold_splits in {"test", "both"}
+    batch_key = None if (args.batch_key is None or str(args.batch_key).lower() == "none") else args.batch_key
 
     os.makedirs(args.fig_dir, exist_ok=True)
 
@@ -785,6 +880,7 @@ def main():
         "fig_dir": args.fig_dir,
         "masked_test_mdata_paths": args.masked_test_mdata_paths,
         "mapping_csv": args.mapping_csv,
+        "batch_key": batch_key,
         "impute_batch_size": args.impute_batch_size,
         "evals": list(EVALS),
         "umap_top_n_celltypes": args.umap_top_n_celltypes,
@@ -829,10 +925,20 @@ def main():
     print(f"[SETUP] Model directory   : {args.model_dir}")
     print(f"[SETUP] Figures directory : {args.fig_dir}")
     print(f"[SETUP] EVAL blocks       : {sorted(EVALS)}")
+    print(f"[SETUP] batch_key         : {batch_key}")
     print("=" * 80)
 
     print(f"[DATA] Loading TRAIN MuData from {args.train_mdata_path} ...")
     mdata_train = mu.read_h5mu(args.train_mdata_path, backed="r")
+    mdata_train.obs.rename(columns={"donor_id": "mouse.id"}, inplace=True)
+    mdata_train.mod["rna"].obs.rename(
+    columns={"donor_id": "mouse.id"},
+    inplace=True)
+    mdata_train.mod["splicing"].obs.rename(
+    columns={"donor_id": "mouse.id"},
+    inplace=True)
+
+
     print(f"[DATA] TRAIN MuData loaded with mods: {list(mdata_train.mod.keys())}")
     print(f"[DATA] TRAIN 'rna' n_obs: {mdata_train['rna'].n_obs}, n_vars: {mdata_train['rna'].n_vars}")
 
@@ -856,7 +962,7 @@ def main():
     print("[MODEL] Setting up SPLICEVI on TRAIN MuData ...")
     SPLICEVI.setup_mudata(
         mdata_train,
-        batch_key=None,
+        batch_key=batch_key,
         size_factor_key="X_library_size",
         rna_layer="length_norm",
         junc_ratio_layer=x_layer,
@@ -1411,6 +1517,7 @@ def main():
             cross_fold_targets,
             args.cross_fold_k,
             cross_fold_classifiers,
+            args.cross_fold_metrics,
             args.fig_dir,
             wandb=wandb if run is not None else None,
         )
@@ -1427,6 +1534,13 @@ def main():
     # -----------------------------------------------------------------
     print(f"[DATA] Loading TEST MuData from {args.test_mdata_path} ...")
     mdata_test = mu.read_h5mu(args.test_mdata_path, backed="r")
+    mdata_test.obs.rename(columns={"donor_id": "mouse.id"}, inplace=True)
+    mdata_test.mod["rna"].obs.rename(
+    columns={"donor_id": "mouse.id"},
+    inplace=True)
+    mdata_test.mod["splicing"].obs.rename(
+    columns={"donor_id": "mouse.id"},
+    inplace=True)
     print(f"[DATA] TEST MuData loaded with mods: {list(mdata_test.mod.keys())}")
     print(f"[DATA] TEST 'rna' n_obs: {mdata_test['rna'].n_obs}, n_vars: {mdata_test['rna'].n_vars}")
 
@@ -1440,7 +1554,7 @@ def main():
     print("[MODEL] Setting up SPLICEVI on TEST MuData ...")
     SPLICEVI.setup_mudata(
         mdata_test,
-        batch_key=None,
+        batch_key=batch_key,
         size_factor_key="X_library_size",
         rna_layer="length_norm",
         junc_ratio_layer=x_layer,
@@ -1513,6 +1627,7 @@ def main():
             cross_fold_targets,
             args.cross_fold_k,
             cross_fold_classifiers,
+            args.cross_fold_metrics,
             args.fig_dir,
             wandb=wandb if run is not None else None,
         )
@@ -1529,6 +1644,20 @@ def main():
         )
         if run is not None:
             wandb.log({"crossfold/results_csv_path": cross_csv})
+
+        if len(CROSS_FOLD_CLASS_RECORDS) > 0:
+            class_df = pd.DataFrame(CROSS_FOLD_CLASS_RECORDS)
+            for tgt, tgt_df in class_df.groupby("target"):
+                tgt_csv = os.path.join(
+                    args.fig_dir, f"cross_fold_classification_per_class_{tgt}.csv"
+                )
+                tgt_df.to_csv(tgt_csv, index=False)
+                print(
+                    f"[CROSS-FOLD] Wrote per-class fold metrics for target '{tgt}' to {tgt_csv} "
+                    f"({tgt_df.shape[0]} rows)."
+                )
+                if run is not None:
+                    wandb.log({f"crossfold/per_class/{tgt}_csv_path": tgt_csv})
 
         if len(CROSS_FOLD_SIGNIFICANCE) > 0:
             sig_df = pd.DataFrame(CROSS_FOLD_SIGNIFICANCE)
@@ -1593,6 +1722,13 @@ def main():
                     f"\n[EVAL/IMPUTE] Masked-ATSE imputation on TEST using {masked_path} (tag={tag})"
                 )
                 mdata_masked = mu.read_h5mu(masked_path, backed="r")
+                mdata_masked.obs.rename(columns={"donor_id": "mouse.id"}, inplace=True)
+                mdata_masked.mod["rna"].obs.rename(
+                columns={"donor_id": "mouse.id"},
+                inplace=True)
+                mdata_masked.mod["splicing"].obs.rename(
+                columns={"donor_id": "mouse.id"},
+                inplace=True)
                 print(
                     f"[EVAL/IMPUTE/{tag}] Masked MuData loaded. 'rna' n_obs: {mdata_masked['rna'].n_obs}"
                 )
@@ -1612,7 +1748,7 @@ def main():
                 print(f"[EVAL/IMPUTE/{tag}] Setting up SPLICEVI on masked MuData...")
                 SPLICEVI.setup_mudata(
                     mdata_masked,
-                    batch_key=None,
+                    batch_key=batch_key,
                     size_factor_key="X_library_size",
                     rna_layer="length_norm",
                     junc_ratio_layer=x_layer,

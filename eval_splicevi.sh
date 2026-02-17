@@ -2,11 +2,10 @@
 #SBATCH --job-name=splicevi_eval_basic
 #SBATCH --output=logs/splicevi_eval_%j.out
 #SBATCH --error=logs/splicevi_eval_%j.err
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:1
-#SBATCH --mem=300G
+#SBATCH --partition=cpu,bigmem,dev
+#SBATCH --mem=180G
 #SBATCH --cpus-per-task=4
-#SBATCH --time=30:00:00
+#SBATCH --time=8:00:00
 
 set -euo pipefail
 
@@ -29,8 +28,9 @@ set -euo pipefail
 TRAIN_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/train_70_30_model_ready_combined_gene_expression_aligned_splicing_20251009_024406_UPDATEDOBS.h5mu"
 TEST_MDATA_PATH="/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/test_30_70_model_ready_combined_gene_expression_aligned_splicing_20251009_024406_UPDATEDOBS.h5mu"
 
-# Optional mapping CSV (can be empty if not used)
-MAPPING_CSV="/gpfs/commons/home/svaidyanathan/repos/multivi_tools_splicing/multivi_splice_utils/runfiles/tissue_celltype_mapping.csv"
+# Optional mapping CSV (set to empty to skip)
+# MAPPING_CSV="/gpfs/commons/home/svaidyanathan/repos/multivi_tools_splicing/multivi_splice_utils/runfiles/tissue_celltype_mapping.csv"
+: "${MAPPING_CSV:=}"
 
 # Optional masked TEST MuData paths for imputation
 # MASKED_TEST_MDATA_PATHS="\
@@ -45,20 +45,34 @@ MASKED_TEST_MDATA_PATHS="\
 # 2) Single model directory to evaluate
 # MODEL_DIR="/gpfs/commons/home/svaidyanathan/repos/SpliceVI/models/splicevi_basic_20260127_143801"  #non linear (yes batch key)
 
-MODEL_DIR="/gpfs/commons/home/svaidyanathan/repos/SpliceVI/models/splicevi_basic_20251213_111454"  #linear (yes batch key)
+# MODEL_DIR="/gpfs/commons/home/svaidyanathan/repos/SpliceVI/models/splicevi_basic_20251213_111454"  #linear (yes batch key)
 
 # MODEL_DIR="/gpfs/commons/home/svaidyanathan/repos/SpliceVI/models/splicevi_basic_20260121_123415" #linear (no batch key)
 
+# MODEL_DIR="/gpfs/commons/home/svaidyanathan/repos/SpliceVI/models/splicevi_basic_20260201_021528" #non linear (no  batch key)
+
+# MODEL_DIR="models/splicevi_basic_MASKED_20260204_220406" #masked 25%, non linear, batch key
+
+# MODEL_DIR="models/splicevi_basic_20260213_133058" #masked 50%, non linear, batch key
+
+# MODEL_DIR="models/splicevi_basic_20260213_173000" #masked 75%, non linear, batch key
+
+MODEL_DIR="models/splicevi_basic_20260217_023514" #subsample 10000 non linear, batch key
+
+# MODEL_DIR="models/splicevi_basic_20260217_054058" #subsample 25000 non linear, batch key
+
+# MODEL_DIR="models/splicevi_basic_20260217_092118" #subsample 50000 non linear, batch key
 
 
-
+# 2.5) Batch key used during training (set to "None" to disable)
+BATCH_KEY="mouse.id"
 # 3) Evaluation blocks to run
 # These must match argparse in eval_splicevi.py (nargs="+")
 EVALS=(
   umap
   # clustering
-  # train_eval
-  # test_eval
+  train_eval
+  test_eval
   cross_fold_classification
   age_r2_heatmap
   masked_impute
@@ -84,11 +98,18 @@ CROSS_FOLD_TARGETS=(
   "broad_cell_type"
   "mouse.id"
   "tissue_celltype"
+  "tissue"
 )
 CROSS_FOLD_K=5
 CROSS_FOLD_CLASSIFIERS=(
   "logreg"
   # "rf"
+)
+CROSS_FOLD_METRICS=(
+  "accuracy"
+  "f1_weighted"
+  "precision_weighted"
+  "recall_weighted"
 )
 
 # 5) Conda / script locations
@@ -124,9 +145,10 @@ echo "[JOB] SPLICEVI basic eval job"
 echo "[JOB] Slurm job ID           : ${SLURM_JOB_ID:-N/A}"
 echo "[JOB] Run name               : ${RUN_NAME}"
 echo "[JOB] MODEL_DIR              : ${MODEL_DIR}"
+echo "[JOB] BATCH_KEY              : ${BATCH_KEY}"
 echo "[JOB] TRAIN_MDATA_PATH       : ${TRAIN_MDATA_PATH}"
 echo "[JOB] TEST_MDATA_PATH        : ${TEST_MDATA_PATH}"
-echo "[JOB] Mapping CSV            : ${MAPPING_CSV}"
+echo "[JOB] Mapping CSV            : ${MAPPING_CSV:-"(none)"}"
 echo "[JOB] Eval output directory  : ${RUN_DIR}"
 echo "[JOB] Figures directory      : ${FIG_DIR}"
 echo "=================================================================="
@@ -146,6 +168,10 @@ done
 echo "[JOB] CROSS_FOLD_CLASSIFIERS:"
 for c in "${CROSS_FOLD_CLASSIFIERS[@]}"; do
   echo "         - ${c}"
+done
+echo "[JOB] CROSS_FOLD_METRICS:"
+for m in "${CROSS_FOLD_METRICS[@]}"; do
+  echo "         - ${m}"
 done
 echo "[JOB] CROSS_FOLD_K      : ${CROSS_FOLD_K}"
 echo "=================================================================="
@@ -197,6 +223,7 @@ EVALS_JOINED="${EVALS[*]}"
 UMAP_OBS_KEYS_JOINED="${UMAP_OBS_KEYS[*]}"
 CROSS_FOLD_TARGETS_JOINED="${CROSS_FOLD_TARGETS[*]}"
 CROSS_FOLD_CLASSIFIERS_JOINED="${CROSS_FOLD_CLASSIFIERS[*]}"
+CROSS_FOLD_METRICS_JOINED="${CROSS_FOLD_METRICS[*]}"
 
 #######################################
 # LAUNCH EVALUATION
@@ -209,8 +236,9 @@ python "${SCRIPT_PATH}" \
   --train_mdata_path "${TRAIN_MDATA_PATH}" \
   --test_mdata_path "${TEST_MDATA_PATH}" \
   --model_dir "${MODEL_DIR}" \
+  --batch_key "${BATCH_KEY}" \
   --fig_dir "${FIG_DIR}" \
-  --mapping_csv "${MAPPING_CSV}" \
+  ${MAPPING_CSV:+--mapping_csv "${MAPPING_CSV}"} \
   --impute_batch_size "${IMPUTE_BATCH_SIZE}" \
   --umap_top_n_celltypes "${UMAP_TOP_N_CELLTYPES}" \
   --umap_obs_keys ${UMAP_OBS_KEYS_JOINED} \
@@ -218,6 +246,7 @@ python "${SCRIPT_PATH}" \
   --cross_fold_targets ${CROSS_FOLD_TARGETS_JOINED} \
   --cross_fold_k "${CROSS_FOLD_K}" \
   --cross_fold_classifiers ${CROSS_FOLD_CLASSIFIERS_JOINED} \
+  --cross_fold_metrics ${CROSS_FOLD_METRICS_JOINED} \
   --evals ${EVALS_JOINED} \
   ${MASKED_TEST_MDATA_PATHS:+--masked_test_mdata_paths ${MASKED_TEST_MDATA_PATHS}} \
   ${WANDB_ARGS}

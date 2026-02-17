@@ -7,7 +7,7 @@ PY="preprocess/make_masked_test_mudata.py"
 FILES=(
   "/gpfs/commons/groups/knowles_lab/Karin/Leaflet-analysis-WD/MOUSE_SPLICING_FOUNDATION/MODEL_INPUT/102025/train_70_30_model_ready_combined_gene_expression_aligned_splicing_20251009_024406.h5mu"
 )
-FRACTIONS=(0.25)
+FRACTIONS=(0.25 0.50 0.75)
 SEED=0
 BATCH_SIZE=256
 

@@ -2,3 +2,6 @@ models/
 logs/
 wandb/
 src/__pycache__/
+manuscript/figure_4_maker.ipynb
+manuscript/data/
+src/weight_exploration.ipynb

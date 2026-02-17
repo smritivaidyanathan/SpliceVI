@@ -188,6 +188,13 @@ def main():
     # ------------------------------
     print("[DATA] Loading MuData from disk...")
     mdata = mu.read_h5mu(args.train_mdata_path, backed="r")
+    mdata.obs.rename(columns={"donor_id": "mouse.id"}, inplace=True)
+    mdata.mod["rna"].obs.rename(
+    columns={"donor_id": "mouse.id"},
+    inplace=True)
+    mdata.mod["splicing"].obs.rename(
+    columns={"donor_id": "mouse.id"},
+    inplace=True)
     if "rna" not in mdata.mod:
         raise ValueError("[DATA] Expected 'rna' modality in MuData.")
     if "splicing" not in mdata.mod:
